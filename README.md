@@ -26,16 +26,14 @@ Control warmth, brightness, and smooth automatic transitions from a clean termin
 Requires Linux and a compositor supporting
 `wlr-gamma-control-unstable-v1`.
 
-Download the archive and checksum from the
-[latest release](https://github.com/KLAMBO365/waywarm/releases/latest), then:
+Install or update to the latest release with:
 
-```console
-sha256sum -c waywarm-*.tar.gz.sha256
-tar -xzf waywarm-*.tar.gz
-install -Dm755 waywarm-*/waywarm ~/.local/bin/waywarm
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/KLAMBO365/waywarm/main/install.sh | sh
 ```
 
-Ensure `~/.local/bin` is in your `PATH`, then launch:
+The installer downloads the release, verifies its SHA-256 checksum, and installs
+`waywarm` to `~/.local/bin`. Ensure that directory is in your `PATH`, then launch:
 
 ```console
 waywarm
@@ -47,6 +45,20 @@ For automatic startup, open the service manager and choose
 ```console
 waywarm daemon
 ```
+
+<details>
+<summary>Manual installation</summary>
+
+Download the archive and checksum from the
+[latest release](https://github.com/KLAMBO365/waywarm/releases/latest), then:
+
+```console
+sha256sum -c waywarm-*.tar.gz.sha256
+tar -xzf waywarm-*.tar.gz
+install -Dm755 waywarm-*/waywarm ~/.local/bin/waywarm
+```
+
+</details>
 
 <details>
 <summary>Build from source (Rust 1.88+)</summary>

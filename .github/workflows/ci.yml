@@ -29,6 +29,12 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
 
+      - name: Validate installer
+        if: matrix.rust == 'stable'
+        run: |
+          sh -n install.sh
+          sh tests/install.sh
+
       - name: Install Rust
         env:
           RUST_TOOLCHAIN: ${{ matrix.rust }}

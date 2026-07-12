@@ -22,6 +22,11 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Validate installer
+        run: |
+          sh -n install.sh
+          sh tests/install.sh
+
       - name: Install Rust
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
