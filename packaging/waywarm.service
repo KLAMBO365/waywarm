@@ -1,0 +1,15 @@
+[Unit]
+Description=Waywarm Wayland blue-light filter
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin
+ExecStart=/usr/bin/env waywarm --daemon
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=3
+
+[Install]
+WantedBy=default.target

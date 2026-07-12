@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  checks:
+    name: Rust ${{ matrix.rust }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["1.88.0", stable]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        env:
+          RUST_TOOLCHAIN: ${{ matrix.rust }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Install lint components
+        if: matrix.rust == 'stable'
+        run: rustup component add rustfmt clippy
+
+      - name: Cache Cargo data
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.rust }}-
+
+      - name: Check formatting
+        if: matrix.rust == 'stable'
+        run: cargo fmt --check
+
+      - name: Run tests
+        run: cargo test --locked --all-targets
+
+      - name: Run Clippy
+        if: matrix.rust == 'stable'
+        run: cargo clippy --locked --all-targets -- -D warnings

@@ -1,0 +1,106 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: x86_64 Linux
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+
+      - name: Cache Cargo data
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+
+      - name: Validate release version
+        id: metadata
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "release tag must match vX.Y.Z" >&2
+            exit 1
+          fi
+
+          version="${BASH_REMATCH[1]}"
+          package_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [[ "$version" != "$package_version" ]]; then
+            echo "tag $RELEASE_TAG does not match Cargo.toml version $package_version" >&2
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run tests
+        run: cargo test --locked --all-targets
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Build release binary
+        run: cargo build --locked --release
+
+      - name: Package release
+        id: package
+        env:
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          package="waywarm-v${VERSION}-x86_64-unknown-linux-gnu"
+          staging="$RUNNER_TEMP/$package"
+          archive="$package.tar.gz"
+
+          mkdir -p "$staging"
+          install -m 0755 target/release/waywarm "$staging/waywarm"
+          install -m 0644 LICENSE "$staging/LICENSE"
+          tar -C "$RUNNER_TEMP" -czf "$archive" "$package"
+          sha256sum "$archive" > "$archive.sha256"
+
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "checksum=$archive.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke-test packaged binary
+        env:
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: "$RUNNER_TEMP/waywarm-v${VERSION}-x86_64-unknown-linux-gnu/waywarm --help"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+          CHECKSUM: ${{ steps.package.outputs.checksum }}
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "$ARCHIVE" "$CHECKSUM" \
+            --verify-tag \
+            --generate-notes \
+            --title "waywarm $VERSION"
