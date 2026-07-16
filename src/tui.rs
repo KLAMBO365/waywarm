@@ -46,6 +46,8 @@ enum Field {
     Filter,
     ManualWarmth,
     ManualBrightness,
+    DayWarmth,
+    DayBrightness,
     NightWarmth,
     NightBrightness,
     NightStart,
@@ -54,11 +56,13 @@ enum Field {
 }
 
 impl Field {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 11] = [
         Self::Mode,
         Self::Filter,
         Self::ManualWarmth,
         Self::ManualBrightness,
+        Self::DayWarmth,
+        Self::DayBrightness,
         Self::NightWarmth,
         Self::NightBrightness,
         Self::NightStart,
@@ -89,7 +93,9 @@ impl Field {
             (Self::ManualWarmth | Self::ManualBrightness, false) => self.index() + 2,
             (Self::ManualWarmth | Self::ManualBrightness, true) => self.index() + 3,
             (
-                Self::NightWarmth
+                Self::DayWarmth
+                | Self::DayBrightness
+                | Self::NightWarmth
                 | Self::NightBrightness
                 | Self::NightStart
                 | Self::DayStart
@@ -97,7 +103,9 @@ impl Field {
                 false,
             ) => self.index() + 3,
             (
-                Self::NightWarmth
+                Self::DayWarmth
+                | Self::DayBrightness
+                | Self::NightWarmth
                 | Self::NightBrightness
                 | Self::NightStart
                 | Self::DayStart
@@ -438,6 +446,22 @@ impl App {
                 let manual = manual_levels(settings);
                 adjust_percent(
                     &mut manual.brightness,
+                    direction,
+                    percent_step,
+                    MIN_BRIGHTNESS,
+                );
+            }
+            Field::DayWarmth => {
+                adjust_percent(
+                    &mut settings.schedule.day.warmth,
+                    direction,
+                    percent_step,
+                    0,
+                );
+            }
+            Field::DayBrightness => {
+                adjust_percent(
+                    &mut settings.schedule.day.brightness,
                     direction,
                     percent_step,
                     MIN_BRIGHTNESS,
@@ -870,7 +894,7 @@ fn backend_status(transient: bool, available: bool) -> &'static str {
 fn screen_areas(area: Rect) -> ScreenAreas {
     let compact = area.height < 34;
     if compact {
-        // 80×24: single-line header, dense metrics/timeline, full 12-line control list.
+        // 80×24: single-line header, dense metrics/timeline, control list (may scroll).
         // 2 + 3 + 3 + 14 + 1 + 1 = 24
         let areas = Layout::vertical([
             Constraint::Length(2),
@@ -1050,8 +1074,8 @@ fn render_settings(frame: &mut Frame, area: Rect, settings: &Settings, selected:
     } else {
         "MANUAL"
     };
-    // Compact lists need every row: 3 group headers + 9 fields = 12 lines.
-    let spacious = inner.height >= 14;
+    // Compact lists need every row: 3 group headers + 11 fields = 14 lines.
+    let spacious = inner.height >= 16;
     let mut items = vec![
         group_item("GENERAL", true),
         value_item("Mode", mode, true, true, false),
@@ -1092,6 +1116,24 @@ fn render_settings(frame: &mut Frame, area: Rect, settings: &Settings, selected:
     }
     items.extend([
         group_item("SCHEDULE", schedule_active),
+        value_item(
+            "Day warmth",
+            format!(
+                "{}%  ·  {} K",
+                settings.schedule.day.warmth,
+                warmth_to_kelvin(settings.schedule.day.warmth)
+            ),
+            schedule_active,
+            false,
+            true,
+        ),
+        value_item(
+            "Day brightness",
+            format!("{}%", settings.schedule.day.brightness),
+            schedule_active,
+            false,
+            true,
+        ),
         value_item(
             "Night warmth",
             format!(
@@ -1277,6 +1319,14 @@ fn selected_help(selected: Field) -> (&'static str, &'static str) {
             "Manual brightness",
             "Adjust immediate display brightness. Changing this switches from Automatic to Manual mode.",
         ),
+        Field::DayWarmth => (
+            "Day warmth",
+            "Choose the warmth held during the day. Zero keeps a neutral white point.",
+        ),
+        Field::DayBrightness => (
+            "Day brightness",
+            "Choose the brightness held during the day while automatic mode is active.",
+        ),
         Field::NightWarmth => (
             "Night warmth",
             "Choose the warmth reached after the evening fade. Higher percentages reduce more blue light.",
@@ -1291,7 +1341,7 @@ fn selected_help(selected: Field) -> (&'static str, &'static str) {
         ),
         Field::DayStart => (
             "Day begins",
-            "Set when the morning transition back to neutral starts in local time.",
+            "Set when the morning transition toward daytime levels starts in local time.",
         ),
         Field::Transition => (
             "Fade duration",
@@ -1467,6 +1517,8 @@ mod tests {
         assert!(rendered.contains("WAYWARM"));
         assert!(rendered.contains("Filter"));
         assert!(rendered.contains("MANUAL OVERRIDE"));
+        assert!(rendered.contains("Day warmth"));
+        assert!(rendered.contains("Night warmth"));
         assert!(rendered.contains("Fade duration"));
         assert!(rendered.contains("HELP"));
         assert!(rendered.contains("CONTROLS"));
@@ -1477,7 +1529,9 @@ mod tests {
         let mut compact = Terminal::new(TestBackend::new(80, 24)).unwrap();
         compact.draw(|frame| app.render(frame)).unwrap();
         let rendered = buffer_text(&compact);
-        assert!(rendered.contains("Fade duration"));
+        // Compact view scrolls the longer schedule list; top schedule rows stay visible.
+        assert!(rendered.contains("Day warmth"));
+        assert!(rendered.contains("Night warmth"));
         assert!(rendered.contains("Connected service"));
         assert!(rendered.contains("TODAY"));
         assert!(!rendered.contains("at least"));

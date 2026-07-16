@@ -38,6 +38,7 @@ Set options:
   --on | --off
   --mode automatic|manual
   --warmth <0-100>  --brightness <10-100>
+  --day-warmth <0-100>  --day-brightness <10-100>
   --night-warmth <0-100>  --night-brightness <10-100>
   --night-start <HH:MM>  --day-start <HH:MM>
   --transition <0-240>  --json

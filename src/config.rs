@@ -31,12 +31,20 @@ impl Levels {
     }
 }
 
+impl Default for Levels {
+    fn default() -> Self {
+        Self::NEUTRAL
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Schedule {
     pub night_start: String,
     pub day_start: String,
     pub transition_minutes: u16,
+    /// Daytime target while automatic mode is active (defaults to neutral).
+    pub day: Levels,
     pub night: Levels,
 }
 
@@ -46,6 +54,7 @@ impl Default for Schedule {
             night_start: "21:00".into(),
             day_start: "07:00".into(),
             transition_minutes: 30,
+            day: Levels::NEUTRAL,
             night: Levels {
                 warmth: 50,
                 brightness: 90,
@@ -69,6 +78,7 @@ impl Schedule {
         if self.transition_minutes > shortest_gap {
             bail!("transition is longer than the gap between day and night start times");
         }
+        self.day.validate()?;
         self.night.validate()
     }
 }
@@ -225,5 +235,31 @@ mod tests {
         assert_eq!(parse_time("07:30").unwrap(), 450);
         assert!(parse_time("7:30").is_err());
         assert!(parse_time("24:00").is_err());
+    }
+
+    #[test]
+    fn missing_day_levels_default_to_neutral() {
+        let source = r#"
+version = 1
+enabled = true
+automatic = true
+
+[manual]
+warmth = 40
+brightness = 90
+
+[schedule]
+night_start = "21:00"
+day_start = "07:00"
+transition_minutes = 30
+
+[schedule.night]
+warmth = 50
+brightness = 90
+"#;
+        let settings: Settings = toml::from_str(source).unwrap();
+        settings.validate().unwrap();
+        assert_eq!(settings.schedule.day, Levels::NEUTRAL);
+        assert_eq!(settings.schedule.night.warmth, 50);
     }
 }

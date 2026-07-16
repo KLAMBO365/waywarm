@@ -100,8 +100,12 @@ fn toggle(args: &[String]) -> Result<()> {
 }
 
 fn daemon_hint(error: anyhow::Error) -> anyhow::Error {
+    let message = format!("{error:#}");
+    if message.contains("outdated") || message.contains("unsupported IPC") {
+        return anyhow::anyhow!("{message}");
+    }
     anyhow::anyhow!(
-        "{error:#}\nstart the background service with `waywarm daemon`, or open the settings UI first"
+        "{message}\nstart the background service with `waywarm daemon`, or open the settings UI first"
     )
 }
 
@@ -128,6 +132,8 @@ struct SetOptions {
     automatic: Option<bool>,
     warmth: Option<u8>,
     brightness: Option<u8>,
+    day_warmth: Option<u8>,
+    day_brightness: Option<u8>,
     night_warmth: Option<u8>,
     night_brightness: Option<u8>,
     night_start: Option<String>,
@@ -168,6 +174,15 @@ fn parse_set_args(args: &[String]) -> Result<SetParse> {
             "--brightness" => {
                 let value = next_value(args, &mut index, "--brightness")?;
                 options.brightness = Some(parse_percent(&value, MIN_BRIGHTNESS, "brightness")?);
+            }
+            "--day-warmth" => {
+                let value = next_value(args, &mut index, "--day-warmth")?;
+                options.day_warmth = Some(parse_percent(&value, 0, "day-warmth")?);
+            }
+            "--day-brightness" => {
+                let value = next_value(args, &mut index, "--day-brightness")?;
+                options.day_brightness =
+                    Some(parse_percent(&value, MIN_BRIGHTNESS, "day-brightness")?);
             }
             "--night-warmth" => {
                 let value = next_value(args, &mut index, "--night-warmth")?;
@@ -254,6 +269,12 @@ fn apply_set_options(settings: &mut Settings, options: &SetOptions) -> Result<()
     if let Some(brightness) = options.brightness {
         settings.manual.brightness = brightness;
     }
+    if let Some(warmth) = options.day_warmth {
+        settings.schedule.day.warmth = warmth;
+    }
+    if let Some(brightness) = options.day_brightness {
+        settings.schedule.day.brightness = brightness;
+    }
     if let Some(warmth) = options.night_warmth {
         settings.schedule.night.warmth = warmth;
     }
@@ -279,6 +300,7 @@ fn apply_set_options(settings: &mut Settings, options: &SetOptions) -> Result<()
     }
 
     settings.manual.validate()?;
+    settings.schedule.day.validate()?;
     settings.schedule.night.validate()?;
     if options.night_start.is_some() || options.day_start.is_some() || options.transition.is_some()
     {
@@ -305,12 +327,14 @@ fn format_status_human(state: &RuntimeState) -> String {
          Mode:       {mode}\n\
          Active:     {}\n\
          Manual:     {}\n\
+         Day:        {}\n\
          Night:      {}\n\
          Schedule:   night {} · day {} · fade {}m\n\
          Backend:    {}\n\
          Outputs:    {outputs}\n",
         format_levels_line(state.active_warmth, state.active_brightness),
         format_levels(settings.manual),
+        format_levels(settings.schedule.day),
         format_levels(settings.schedule.night),
         settings.schedule.night_start,
         settings.schedule.day_start,
@@ -339,6 +363,8 @@ Options:\n\
   --mode automatic|manual      Schedule mode (aliases: auto)\n\
   --warmth <0-100>             Manual warmth (implies enabled + manual)\n\
   --brightness <10-100>        Manual brightness (implies enabled + manual)\n\
+  --day-warmth <0-100>         Daytime schedule warmth\n\
+  --day-brightness <10-100>    Daytime schedule brightness\n\
   --night-warmth <0-100>       Night schedule warmth\n\
   --night-brightness <10-100>  Night schedule brightness\n\
   --night-start <HH:MM>        Evening transition start\n\
@@ -445,6 +471,8 @@ mod tests {
     fn schedule_fields_update() {
         let mut settings = Settings::default();
         let options = SetOptions {
+            day_warmth: Some(15),
+            day_brightness: Some(100),
             night_warmth: Some(70),
             night_brightness: Some(85),
             night_start: Some("22:00".into()),
@@ -459,6 +487,10 @@ mod tests {
                 night_start: "22:00".into(),
                 day_start: "06:30".into(),
                 transition_minutes: 45,
+                day: Levels {
+                    warmth: 15,
+                    brightness: 100,
+                },
                 night: Levels {
                     warmth: 70,
                     brightness: 85,
@@ -480,6 +512,8 @@ mod tests {
         assert!(text.contains("Filter:"));
         assert!(text.contains("Mode:"));
         assert!(text.contains("Active:"));
+        assert!(text.contains("Day:"));
+        assert!(text.contains("Night:"));
         assert!(text.contains("warmth 25%"));
         assert!(text.contains("eDP-1, HDMI-A-1"));
         assert!(text.contains("wlr-gamma-control-v1"));

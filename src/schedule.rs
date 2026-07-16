@@ -18,23 +18,25 @@ pub fn scheduled_levels(schedule: &Schedule, minute: f64) -> Result<Levels> {
     let day = parse_time(&schedule.day_start)? as f64;
     let night = parse_time(&schedule.night_start)? as f64;
     let duration = schedule.transition_minutes as f64;
+    let day_levels = schedule.day;
+    let night_levels = schedule.night;
 
     let day_progress = transition_progress(minute, day, duration);
     if day_progress < 1.0 {
-        return Ok(interpolate(schedule.night, Levels::NEUTRAL, day_progress));
+        return Ok(interpolate(night_levels, day_levels, day_progress));
     }
 
     let since_day = forward_distance(day, minute);
     let until_night = forward_distance(day, night);
     if since_day < until_night {
-        return Ok(Levels::NEUTRAL);
+        return Ok(day_levels);
     }
 
     let night_progress = transition_progress(minute, night, duration);
     if night_progress < 1.0 {
-        return Ok(interpolate(Levels::NEUTRAL, schedule.night, night_progress));
+        return Ok(interpolate(day_levels, night_levels, night_progress));
     }
-    Ok(schedule.night)
+    Ok(night_levels)
 }
 
 fn transition_progress(now: f64, start: f64, duration: f64) -> f64 {
@@ -71,7 +73,7 @@ mod tests {
     fn returns_day_and_night_targets() {
         assert_eq!(
             scheduled_levels(&schedule(), 12.0 * 60.0).unwrap(),
-            Levels::NEUTRAL
+            schedule().day
         );
         assert_eq!(
             scheduled_levels(&schedule(), 23.0 * 60.0).unwrap(),
@@ -106,9 +108,35 @@ mod tests {
         let mut value = schedule();
         value.transition_minutes = 0;
         assert_eq!(scheduled_levels(&value, 21.0 * 60.0).unwrap(), value.night);
+        assert_eq!(scheduled_levels(&value, 7.0 * 60.0).unwrap(), value.day);
+    }
+
+    #[test]
+    fn uses_custom_day_levels() {
+        let mut value = schedule();
+        value.day = Levels {
+            warmth: 20,
+            brightness: 100,
+        };
+        value.night = Levels {
+            warmth: 60,
+            brightness: 80,
+        };
+        assert_eq!(scheduled_levels(&value, 12.0 * 60.0).unwrap(), value.day);
+        assert_eq!(scheduled_levels(&value, 23.0 * 60.0).unwrap(), value.night);
         assert_eq!(
-            scheduled_levels(&value, 7.0 * 60.0).unwrap(),
-            Levels::NEUTRAL
+            scheduled_levels(&value, 21.0 * 60.0 + 15.0).unwrap(),
+            Levels {
+                warmth: 40,
+                brightness: 90
+            }
+        );
+        assert_eq!(
+            scheduled_levels(&value, 7.0 * 60.0 + 15.0).unwrap(),
+            Levels {
+                warmth: 40,
+                brightness: 90
+            }
         );
     }
 }

@@ -355,7 +355,11 @@ fn handle_request(request: Request, state: &mut DaemonState) -> Response {
                 Err(error) => error_response(format!("{error:#}")),
             }
         }
-        _ => error_response("unsupported IPC protocol version"),
+        Request::GetState { version } | Request::ReplaceSettings { version, .. } => {
+            error_response(format!(
+                "unsupported IPC protocol version {version} (daemon expects {IPC_VERSION}); reinstall and restart the Waywarm service"
+            ))
+        }
     }
 }
 

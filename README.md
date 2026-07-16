@@ -17,7 +17,8 @@ Control warmth, brightness, and smooth automatic transitions from a clean termin
 ## Highlights
 
 - Live warmth and brightness controls
-- Automatic schedules with smooth transitions
+- Automatic schedules with separate day and night targets
+- Smooth transitions between day and night
 - Standalone mode or an optional systemd user service
 - Immediate, persistent settings
 
@@ -99,6 +100,7 @@ waywarm enable
 waywarm disable
 waywarm set --warmth 40 --brightness 90
 waywarm set --mode automatic
+waywarm set --day-warmth 10 --night-warmth 55
 waywarm set --night-start 21:30 --transition 45
 ```
 

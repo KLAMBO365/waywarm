@@ -2,7 +2,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Settings;
 
-pub const IPC_VERSION: u32 = 1;
+/// Bump when the settings/runtime shape the daemon must understand changes.
+/// Clients and daemons with mismatched versions refuse to talk so upgrades
+/// cannot silently drop fields (for example day schedule levels).
+pub const IPC_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

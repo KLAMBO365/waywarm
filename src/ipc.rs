@@ -42,7 +42,16 @@ pub fn replace_settings(settings: crate::config::Settings) -> Result<RuntimeStat
 fn request_state(request: Request) -> Result<RuntimeState> {
     match exchange(&request)? {
         Response::State { state, .. } => Ok(state),
-        Response::Error { message, .. } => bail!(message),
+        Response::Error { message, .. } => {
+            if message.contains("unsupported IPC protocol version") {
+                bail!(
+                    "{message}\n\
+                     the background service is outdated; run `waywarm daemon` and choose \
+                     Install or update and start"
+                );
+            }
+            bail!(message)
+        }
     }
 }
 
@@ -50,7 +59,7 @@ fn exchange(request: &Request) -> Result<Response> {
     let path = socket_path()?;
     let mut stream = UnixStream::connect(&path).with_context(|| {
         format!(
-            "cannot connect to the Waywarm daemon at {}; start waywarm.service",
+            "cannot connect to the Waywarm daemon at {}; start waywarm.service or open the settings UI",
             path.display()
         )
     })?;
