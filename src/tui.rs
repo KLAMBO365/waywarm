@@ -4,6 +4,7 @@ use std::{
 };
 
 use anyhow::{Result, bail};
+use chrono::{Local, Timelike};
 use ratatui::{
     DefaultTerminal, Frame,
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -17,13 +18,26 @@ use ratatui::{
 };
 
 use crate::{
-    config::{Levels, MAX_TRANSITION_MINUTES, MIN_BRIGHTNESS, Settings, parse_time},
+    config::{Levels, MAX_TRANSITION_MINUTES, MIN_BRIGHTNESS, Schedule, Settings, parse_time},
     daemon::TransientBackend,
     gamma::warmth_to_kelvin,
     ipc::{query_state, replace_settings},
     protocol::RuntimeState,
     service::retire_legacy_service,
 };
+
+// ── palette ──────────────────────────────────────────────────────────────────
+
+const TEXT: Color = Color::White;
+const MUTED: Color = Color::DarkGray;
+const BORDER: Color = Color::DarkGray;
+const ACCENT: Color = Color::Yellow;
+const WARM: Color = Color::LightYellow;
+const COOL: Color = Color::Cyan;
+/// Highlight for the current-time column on the schedule bar (same glyph, distinct style).
+const NOW: Color = Color::White;
+
+// ── fields ───────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy)]
 #[repr(usize)]
@@ -65,11 +79,15 @@ impl Field {
         Self::ALL[(self.index() + 1) % Self::ALL.len()]
     }
 
+    /// Map a field onto its row in the settings list (including group headers / spacers).
+    ///
+    /// Layout without leading blank:
+    /// GENERAL, Mode, Filter, [blank], MANUAL…, Warmth, Brightness, [blank], SCHEDULE…
     fn row_index(self, spacious: bool) -> usize {
         match (self, spacious) {
-            (Self::Mode | Self::Filter, _) => self.index() + 2,
-            (Self::ManualWarmth | Self::ManualBrightness, false) => self.index() + 3,
-            (Self::ManualWarmth | Self::ManualBrightness, true) => self.index() + 4,
+            (Self::Mode | Self::Filter, _) => self.index() + 1,
+            (Self::ManualWarmth | Self::ManualBrightness, false) => self.index() + 2,
+            (Self::ManualWarmth | Self::ManualBrightness, true) => self.index() + 3,
             (
                 Self::NightWarmth
                 | Self::NightBrightness
@@ -77,7 +95,7 @@ impl Field {
                 | Self::DayStart
                 | Self::Transition,
                 false,
-            ) => self.index() + 4,
+            ) => self.index() + 3,
             (
                 Self::NightWarmth
                 | Self::NightBrightness
@@ -85,7 +103,7 @@ impl Field {
                 | Self::DayStart
                 | Self::Transition,
                 true,
-            ) => self.index() + 6,
+            ) => self.index() + 5,
         }
     }
 
@@ -93,6 +111,164 @@ impl Field {
         matches!(self, Self::Mode | Self::Filter)
     }
 }
+
+// ── timeline model ───────────────────────────────────────────────────────────
+
+const MINUTES_PER_DAY: u16 = 24 * 60;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimelinePhase {
+    Day,
+    EveningFade,
+    Night,
+    MorningFade,
+}
+
+impl TimelinePhase {
+    fn glyph(self) -> &'static str {
+        match self {
+            Self::Day => "█",
+            Self::Night => "█",
+            Self::EveningFade | Self::MorningFade => "▒",
+        }
+    }
+
+    fn color(self, active: bool) -> Color {
+        if !active {
+            return MUTED;
+        }
+        match self {
+            Self::Day => COOL,
+            Self::Night => WARM,
+            Self::EveningFade | Self::MorningFade => ACCENT,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TimelineSegment {
+    phase: TimelinePhase,
+    /// Inclusive start minute in [0, 1440).
+    start: u16,
+    /// Exclusive end minute in (0, 1440]; 1440 means end-of-day.
+    end: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TimelineView {
+    segments: Vec<TimelineSegment>,
+    day_start: u16,
+    night_start: u16,
+    transition_minutes: u16,
+    now_minute: u16,
+}
+
+impl TimelineView {
+    fn from_schedule(schedule: &Schedule, now_minute: u16) -> Result<Self> {
+        let day_start = parse_time(&schedule.day_start)?;
+        let night_start = parse_time(&schedule.night_start)?;
+        let transition_minutes = schedule.transition_minutes;
+        let segments = build_timeline_segments(day_start, night_start, transition_minutes);
+        Ok(Self {
+            segments,
+            day_start,
+            night_start,
+            transition_minutes,
+            now_minute: now_minute % MINUTES_PER_DAY,
+        })
+    }
+
+    fn phase_at(&self, minute: u16) -> TimelinePhase {
+        let minute = minute % MINUTES_PER_DAY;
+        for segment in &self.segments {
+            if minute >= segment.start && minute < segment.end {
+                return segment.phase;
+            }
+        }
+        // Fallback: last segment wrapping (should not hit if segments cover full day).
+        self.segments
+            .last()
+            .map(|segment| segment.phase)
+            .unwrap_or(TimelinePhase::Day)
+    }
+}
+
+/// Build non-overlapping segments covering [0, 1440) that match schedule semantics.
+fn build_timeline_segments(
+    day_start: u16,
+    night_start: u16,
+    transition_minutes: u16,
+) -> Vec<TimelineSegment> {
+    // Event table: at each boundary the phase that begins.
+    let mut events: Vec<(u16, TimelinePhase)> = Vec::with_capacity(4);
+    if transition_minutes == 0 {
+        events.push((day_start, TimelinePhase::Day));
+        events.push((night_start, TimelinePhase::Night));
+    } else {
+        let morning_end = add_minutes(day_start, transition_minutes);
+        let evening_end = add_minutes(night_start, transition_minutes);
+        events.push((day_start, TimelinePhase::MorningFade));
+        events.push((morning_end, TimelinePhase::Day));
+        events.push((night_start, TimelinePhase::EveningFade));
+        events.push((evening_end, TimelinePhase::Night));
+    }
+    events.sort_by_key(|(minute, _)| *minute);
+    events.dedup_by_key(|(minute, _)| *minute);
+
+    if events.is_empty() {
+        return vec![TimelineSegment {
+            phase: TimelinePhase::Day,
+            start: 0,
+            end: MINUTES_PER_DAY,
+        }];
+    }
+
+    // Determine phase active at minute 0 from the last event of the previous day.
+    let phase_at_midnight = events
+        .last()
+        .map(|(_, phase)| *phase)
+        .unwrap_or(TimelinePhase::Day);
+
+    let mut segments = Vec::new();
+    let mut cursor = 0u16;
+    let mut phase = phase_at_midnight;
+
+    for (minute, next_phase) in &events {
+        if *minute > cursor {
+            segments.push(TimelineSegment {
+                phase,
+                start: cursor,
+                end: *minute,
+            });
+        }
+        cursor = *minute;
+        phase = *next_phase;
+    }
+    if cursor < MINUTES_PER_DAY {
+        segments.push(TimelineSegment {
+            phase,
+            start: cursor,
+            end: MINUTES_PER_DAY,
+        });
+    }
+    segments
+}
+
+fn add_minutes(start: u16, duration: u16) -> u16 {
+    (start + duration) % MINUTES_PER_DAY
+}
+
+fn format_hhmm(minute: u16) -> String {
+    let minute = minute % MINUTES_PER_DAY;
+    format!("{:02}:{:02}", minute / 60, minute % 60)
+}
+
+fn current_minute_of_day() -> u16 {
+    let now = Local::now();
+    (now.hour() as u16) * 60 + now.minute() as u16
+}
+
+// ── entry ────────────────────────────────────────────────────────────────────
 
 pub fn run() -> Result<()> {
     let (state, transient_backend) = connect_or_start()?;
@@ -120,6 +296,8 @@ fn connect_or_start() -> Result<(RuntimeState, Option<TransientBackend>)> {
     bail!("temporary Waywarm backend did not become ready within 3 seconds")
 }
 
+// ── app state ────────────────────────────────────────────────────────────────
+
 struct App {
     state: RuntimeState,
     selected: Field,
@@ -132,6 +310,7 @@ struct App {
 struct ScreenAreas {
     header: Rect,
     metrics: Rect,
+    timeline: Rect,
     settings: Rect,
     help: Option<Rect>,
     notice: Rect,
@@ -170,11 +349,6 @@ impl Notice {
         }
     }
 }
-
-const TEXT: Color = Color::White;
-const MUTED: Color = Color::DarkGray;
-const BORDER: Color = Color::DarkGray;
-const YELLOW: Color = Color::Yellow;
 
 impl App {
     fn new(state: RuntimeState, transient: bool) -> Self {
@@ -351,7 +525,7 @@ impl App {
             frame.render_widget(
                 Paragraph::new("Waywarm needs a terminal of at least 80 × 24")
                     .alignment(Alignment::Center)
-                    .style(Style::default().fg(YELLOW)),
+                    .style(Style::default().fg(ACCENT)),
                 frame.area(),
             );
             return;
@@ -364,79 +538,9 @@ impl App {
         });
         let areas = screen_areas(content);
 
-        let output_text = if self.state.outputs.is_empty() {
-            "No displays detected".into()
-        } else {
-            self.state.outputs.join("  ·  ")
-        };
-        let daemon_status = backend_status(self.transient, self.backend_available);
-        let header_block = Block::default()
-            .borders(Borders::BOTTOM)
-            .border_style(Style::default().fg(BORDER));
-        let header_inner = header_block.inner(areas.header);
-        frame.render_widget(header_block, areas.header);
-        let header_rows =
-            Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(header_inner);
-        let header_columns =
-            Layout::horizontal([Constraint::Min(1), Constraint::Length(12)]).split(header_rows[0]);
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![Span::styled(
-                " WAYWARM ",
-                Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
-            )])),
-            header_columns[0],
-        );
-        frame.render_widget(
-            Paragraph::new("[ q ]  Quit")
-                .alignment(Alignment::Right)
-                .style(Style::default().fg(MUTED)),
-            header_columns[1],
-        );
-        let daemon_value = format!("[{daemon_status}]");
-        let prefix_width = 8 + daemon_value.chars().count() + 10;
-        let output_width = header_rows[1].width.saturating_sub(prefix_width as u16) as usize;
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(" DAEMON ", Style::default().fg(MUTED)),
-                Span::styled(
-                    daemon_value,
-                    Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("  OUTPUTS ", Style::default().fg(MUTED)),
-                Span::styled(
-                    truncate_with_ellipsis(&output_text, output_width),
-                    Style::default().fg(TEXT),
-                ),
-            ])),
-            header_rows[1],
-        );
-
-        let gauges = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .spacing(2)
-            .split(areas.metrics);
-        render_metric(
-            frame,
-            gauges[0],
-            "Warmth",
-            format!(
-                "{}%  ·  {} K",
-                self.state.active_warmth,
-                warmth_to_kelvin(self.state.active_warmth)
-            ),
-            self.state.active_warmth,
-            YELLOW,
-            areas.compact,
-        );
-        render_metric(
-            frame,
-            gauges[1],
-            "Brightness",
-            format!("{}%", self.state.active_brightness),
-            self.state.active_brightness,
-            YELLOW,
-            areas.compact,
-        );
-
+        self.render_header(frame, areas.header);
+        self.render_metrics(frame, areas.metrics, areas.compact);
+        self.render_timeline(frame, areas.timeline, areas.compact);
         render_settings(frame, areas.settings, &self.state.settings, self.selected);
 
         if let Some(help_area) = areas.help {
@@ -445,9 +549,9 @@ impl App {
                 Paragraph::new(Line::from(vec![
                     Span::styled(
                         " i ",
-                        Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                     ),
-                    Span::raw("  "),
+                    Span::raw(" "),
                     Span::styled(
                         format!("{selected_name}. "),
                         Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
@@ -464,6 +568,293 @@ impl App {
         render_notice(frame, areas.notice, notice, error);
         render_footer(frame, areas.footer, self.selected);
     }
+
+    fn render_header(&self, frame: &mut Frame, area: Rect) {
+        let output_text = if self.state.outputs.is_empty() {
+            "No displays detected".into()
+        } else {
+            self.state.outputs.join("  ·  ")
+        };
+        let daemon_status = backend_status(self.transient, self.backend_available);
+        let status_color = match daemon_status {
+            "OFFLINE" => ACCENT,
+            "TEMPORARY" => WARM,
+            _ => COOL,
+        };
+        let daemon_value = format!(" {daemon_status} ");
+
+        let header_block = Block::default()
+            .borders(Borders::BOTTOM)
+            .border_style(Style::default().fg(BORDER));
+        let header_inner = header_block.inner(area);
+        frame.render_widget(header_block, area);
+
+        // Compact header is a single status row; spacious keeps brand + meta rows.
+        if header_inner.height <= 1 {
+            let columns = Layout::horizontal([Constraint::Min(1), Constraint::Length(12)])
+                .split(header_inner);
+            // " WAYWARM " + status chip + spaces ≈ fixed prefix before outputs.
+            let prefix_chars = 9 + daemon_value.chars().count() + 1;
+            let output_width = columns[0].width.saturating_sub(prefix_chars as u16) as usize;
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        " WAYWARM ",
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        daemon_value,
+                        Style::default()
+                            .fg(status_color)
+                            .add_modifier(Modifier::BOLD)
+                            .add_modifier(Modifier::REVERSED),
+                    ),
+                    Span::styled(" ", Style::default().fg(MUTED)),
+                    Span::styled(
+                        truncate_with_ellipsis(&output_text, output_width),
+                        Style::default().fg(TEXT),
+                    ),
+                ])),
+                columns[0],
+            );
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        "[ q ]",
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" Quit", Style::default().fg(MUTED)),
+                ]))
+                .alignment(Alignment::Right),
+                columns[1],
+            );
+            return;
+        }
+
+        let header_rows =
+            Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(header_inner);
+        let header_columns =
+            Layout::horizontal([Constraint::Min(1), Constraint::Length(12)]).split(header_rows[0]);
+
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    " WAYWARM ",
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("·", Style::default().fg(MUTED)),
+                Span::styled(" dashboard ", Style::default().fg(MUTED)),
+            ])),
+            header_columns[0],
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    "[ q ]",
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" Quit", Style::default().fg(MUTED)),
+            ]))
+            .alignment(Alignment::Right),
+            header_columns[1],
+        );
+
+        let prefix_width = 8 + daemon_value.chars().count() + 10;
+        let output_width = header_rows[1].width.saturating_sub(prefix_width as u16) as usize;
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" DAEMON ", Style::default().fg(MUTED)),
+                Span::styled(
+                    daemon_value,
+                    Style::default()
+                        .fg(status_color)
+                        .add_modifier(Modifier::BOLD)
+                        .add_modifier(Modifier::REVERSED),
+                ),
+                Span::styled("  OUTPUTS ", Style::default().fg(MUTED)),
+                Span::styled(
+                    truncate_with_ellipsis(&output_text, output_width),
+                    Style::default().fg(TEXT),
+                ),
+            ])),
+            header_rows[1],
+        );
+    }
+
+    fn render_metrics(&self, frame: &mut Frame, area: Rect, compact: bool) {
+        let gauges = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .spacing(2)
+            .split(area);
+        render_metric(
+            frame,
+            gauges[0],
+            "Warmth",
+            format!(
+                "{}%  ·  {} K",
+                self.state.active_warmth,
+                warmth_to_kelvin(self.state.active_warmth)
+            ),
+            self.state.active_warmth,
+            WARM,
+            compact,
+        );
+        render_metric(
+            frame,
+            gauges[1],
+            "Brightness",
+            format!("{}%", self.state.active_brightness),
+            self.state.active_brightness,
+            ACCENT,
+            compact,
+        );
+    }
+
+    fn render_timeline(&self, frame: &mut Frame, area: Rect, compact: bool) {
+        let schedule_active = self.state.settings.enabled && self.state.settings.automatic;
+        let now = current_minute_of_day();
+        let timeline = TimelineView::from_schedule(&self.state.settings.schedule, now).ok();
+
+        let title = match (&timeline, schedule_active, compact) {
+            (Some(view), true, true) => format!(
+                " TODAY · day {} · night {} ",
+                format_hhmm(view.day_start),
+                format_hhmm(view.night_start)
+            ),
+            (Some(_), false, _) => " TODAY · inactive ".to_owned(),
+            _ => " TODAY ".to_owned(),
+        };
+        let block = panel_block_owned(title);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let Some(timeline) = timeline else {
+            frame.render_widget(
+                Paragraph::new("Schedule times are invalid")
+                    .style(Style::default().fg(ACCENT))
+                    .alignment(Alignment::Center),
+                inner,
+            );
+            return;
+        };
+
+        // Height-3 panel → 1 inner row: bar only (times live in the title on compact).
+        if inner.height <= 1 || compact {
+            let bar = render_timeline_bar(inner.width as usize, &timeline, schedule_active);
+            if inner.height <= 1 {
+                frame.render_widget(Paragraph::new(bar), inner);
+            } else {
+                let rows =
+                    Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(inner);
+                let legend = format!(
+                    " day {} · night {} · fade {}m · now {}",
+                    format_hhmm(timeline.day_start),
+                    format_hhmm(timeline.night_start),
+                    timeline.transition_minutes,
+                    format_hhmm(timeline.now_minute),
+                );
+                frame.render_widget(Paragraph::new(bar), rows[0]);
+                frame.render_widget(
+                    Paragraph::new(legend).style(Style::default().fg(MUTED)),
+                    rows[1],
+                );
+            }
+            return;
+        }
+
+        let rows = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("  24h schedule", Style::default().fg(MUTED)),
+                Span::styled("  ·  ", Style::default().fg(MUTED)),
+                phase_legend(TimelinePhase::Day, schedule_active),
+                Span::raw(" "),
+                phase_legend(TimelinePhase::EveningFade, schedule_active),
+                Span::raw(" "),
+                phase_legend(TimelinePhase::Night, schedule_active),
+            ])),
+            rows[0],
+        );
+
+        let bar = render_timeline_bar(rows[1].width as usize, &timeline, schedule_active);
+        frame.render_widget(Paragraph::new(bar), rows[1]);
+
+        let legend = format!(
+            "  Day begins {}   Night begins {}   Fade {} min   Now {}",
+            format_hhmm(timeline.day_start),
+            format_hhmm(timeline.night_start),
+            timeline.transition_minutes,
+            format_hhmm(timeline.now_minute),
+        );
+        frame.render_widget(
+            Paragraph::new(legend).style(Style::default().fg(MUTED)),
+            rows[2],
+        );
+    }
+}
+
+fn phase_legend(phase: TimelinePhase, active: bool) -> Span<'static> {
+    let label = match phase {
+        TimelinePhase::Day => " day ",
+        TimelinePhase::EveningFade | TimelinePhase::MorningFade => " fade ",
+        TimelinePhase::Night => " night ",
+    };
+    Span::styled(
+        label,
+        Style::default()
+            .fg(if active { TEXT } else { MUTED })
+            .bg(phase.color(active)),
+    )
+}
+
+fn render_timeline_bar(width: usize, timeline: &TimelineView, active: bool) -> Line<'static> {
+    if width == 0 {
+        return Line::default();
+    }
+
+    let now_col = ((u32::from(timeline.now_minute) * width as u32) / u32::from(MINUTES_PER_DAY))
+        .min(width.saturating_sub(1) as u32) as usize;
+
+    let mut spans = Vec::with_capacity(width);
+    let mut col = 0;
+    while col < width {
+        let minute = ((col as u32 * u32::from(MINUTES_PER_DAY)) / width as u32) as u16;
+        let phase = timeline.phase_at(minute);
+
+        // Collapse consecutive same-styled columns into one span for efficiency.
+        let mut end = col + 1;
+        while end < width {
+            let end_minute = ((end as u32 * u32::from(MINUTES_PER_DAY)) / width as u32) as u16;
+            if timeline.phase_at(end_minute) != phase || end == now_col || col == now_col {
+                break;
+            }
+            end += 1;
+        }
+
+        if col == now_col {
+            // Same phase glyph as neighbors; reverse video marks "now" without a special icon.
+            spans.push(Span::styled(
+                phase.glyph(),
+                Style::default()
+                    .fg(NOW)
+                    .bg(phase.color(active))
+                    .add_modifier(Modifier::BOLD),
+            ));
+            col += 1;
+            continue;
+        }
+
+        let count = end - col;
+        let fill = phase.glyph().repeat(count);
+        spans.push(Span::styled(fill, Style::default().fg(phase.color(active))));
+        col = end;
+    }
+    Line::from(spans)
 }
 
 fn backend_status(transient: bool, available: bool) -> &'static str {
@@ -479,10 +870,13 @@ fn backend_status(transient: bool, available: bool) -> &'static str {
 fn screen_areas(area: Rect) -> ScreenAreas {
     let compact = area.height < 34;
     if compact {
+        // 80×24: single-line header, dense metrics/timeline, full 12-line control list.
+        // 2 + 3 + 3 + 14 + 1 + 1 = 24
         let areas = Layout::vertical([
+            Constraint::Length(2),
             Constraint::Length(3),
-            Constraint::Length(4),
-            Constraint::Min(15),
+            Constraint::Length(3),
+            Constraint::Min(14),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
@@ -490,21 +884,24 @@ fn screen_areas(area: Rect) -> ScreenAreas {
         ScreenAreas {
             header: areas[0],
             metrics: areas[1],
-            settings: areas[2],
+            timeline: areas[2],
+            settings: areas[3],
             help: None,
-            notice: areas[3],
-            footer: areas[4],
+            notice: areas[4],
+            footer: areas[5],
             compact,
         }
     } else {
         let areas = Layout::vertical([
             Constraint::Length(3),
             Constraint::Length(1),
-            Constraint::Length(7),
+            Constraint::Length(6),
             Constraint::Length(1),
-            Constraint::Min(14),
+            Constraint::Length(5),
             Constraint::Length(1),
-            Constraint::Length(4),
+            Constraint::Min(12),
+            Constraint::Length(1),
+            Constraint::Length(3),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
@@ -512,20 +909,25 @@ fn screen_areas(area: Rect) -> ScreenAreas {
         ScreenAreas {
             header: areas[0],
             metrics: areas[2],
-            settings: areas[4],
-            help: Some(areas[6]),
-            notice: areas[7],
-            footer: areas[8],
+            timeline: areas[4],
+            settings: areas[6],
+            help: Some(areas[8]),
+            notice: areas[9],
+            footer: areas[10],
             compact,
         }
     }
 }
 
 fn panel_block(title: &'static str) -> Block<'static> {
+    panel_block_owned(title.to_owned())
+}
+
+fn panel_block_owned(title: String) -> Block<'static> {
     Block::default()
         .title(Span::styled(
             title,
-            Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -535,7 +937,7 @@ fn panel_block(title: &'static str) -> Block<'static> {
 
 fn render_metric(
     frame: &mut Frame,
-    area: ratatui::layout::Rect,
+    area: Rect,
     name: &str,
     value: String,
     percent: u8,
@@ -554,6 +956,21 @@ fn render_metric(
     let metric_inner = metric_block.inner(area);
     frame.render_widget(metric_block, area);
     if compact {
+        // Height-3 panel → 1 inner row: value overlaid as gauge label.
+        // Height-4+ → value line + gauge.
+        if metric_inner.height <= 1 {
+            frame.render_widget(
+                LineGauge::default()
+                    .ratio(percent as f64 / 100.0)
+                    .label(value)
+                    .filled_symbol("█")
+                    .unfilled_symbol("░")
+                    .filled_style(Style::default().fg(color))
+                    .unfilled_style(Style::default().fg(BORDER)),
+                metric_inner,
+            );
+            return;
+        }
         let rows =
             Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(metric_inner);
         frame.render_widget(
@@ -579,14 +996,15 @@ fn render_metric(
         vertical: 0,
     });
     let rows = Layout::vertical([
-        Constraint::Length(2),
+        Constraint::Length(1),
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
     .split(content);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("CURRENT   ", Style::default().fg(MUTED)),
+            Span::styled("CURRENT  ", Style::default().fg(MUTED)),
             Span::styled(
                 value,
                 Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
@@ -602,7 +1020,7 @@ fn render_metric(
             .unfilled_symbol("░")
             .filled_style(Style::default().fg(color))
             .unfilled_style(Style::default().fg(BORDER)),
-        rows[1],
+        rows[2],
     );
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -616,12 +1034,12 @@ fn render_metric(
                 Style::default().fg(MUTED),
             ),
         ])),
-        rows[2],
+        rows[3],
     );
 }
 
 fn render_settings(frame: &mut Frame, area: Rect, settings: &Settings, selected: Field) {
-    let block = panel_block(" SETTINGS ");
+    let block = panel_block(" CONTROLS ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -632,9 +1050,9 @@ fn render_settings(frame: &mut Frame, area: Rect, settings: &Settings, selected:
     } else {
         "MANUAL"
     };
+    // Compact lists need every row: 3 group headers + 9 fields = 12 lines.
     let spacious = inner.height >= 14;
     let mut items = vec![
-        ListItem::new(""),
         group_item("GENERAL", true),
         value_item("Mode", mode, true, true, false),
         value_item(
@@ -729,7 +1147,7 @@ fn group_item(label: &'static str, active: bool) -> ListItem<'static> {
     ListItem::new(Span::styled(
         label,
         Style::default()
-            .fg(if active { YELLOW } else { MUTED })
+            .fg(if active { ACCENT } else { MUTED })
             .add_modifier(Modifier::BOLD),
     ))
 }
@@ -745,18 +1163,18 @@ fn value_item(
     let value = if adjustable {
         format!("‹ {value} ›")
     } else {
-        format!("[{value}]")
+        format!("[ {value} ]")
     };
     let base_color = if active { TEXT } else { MUTED };
     let value_color = if !active {
         MUTED
     } else if accent {
-        YELLOW
+        ACCENT
     } else {
         TEXT
     };
     ListItem::new(Line::from(vec![
-        Span::styled(format!("{label:<24}"), Style::default().fg(base_color)),
+        Span::styled(format!("{label:<22}"), Style::default().fg(base_color)),
         Span::styled(
             value,
             Style::default()
@@ -774,12 +1192,12 @@ fn render_notice(frame: &mut Frame, area: Rect, message: &str, error: bool) {
             Span::styled(
                 prefix,
                 Style::default()
-                    .fg(if error { YELLOW } else { MUTED })
+                    .fg(if error { ACCENT } else { MUTED })
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 truncate_with_ellipsis(message, available),
-                Style::default().fg(if error { YELLOW } else { TEXT }),
+                Style::default().fg(if error { ACCENT } else { TEXT }),
             ),
         ])),
         area,
@@ -789,25 +1207,25 @@ fn render_notice(frame: &mut Frame, area: Rect, message: &str, error: bool) {
 fn render_footer(frame: &mut Frame, area: Rect, selected: Field) {
     let controls = if selected.is_toggle() {
         vec![
-            key(" ↑/↓ "),
-            muted("Navigate   "),
-            key(" ←/→ "),
-            muted("Set   "),
-            key(" Enter/Space "),
-            muted("Toggle   "),
-            key(" q "),
-            muted("Quit"),
+            key_chip("↑/↓"),
+            muted(" Navigate  "),
+            key_chip("←/→"),
+            muted(" Set  "),
+            key_chip("Enter"),
+            muted(" Toggle  "),
+            key_chip("q"),
+            muted(" Quit"),
         ]
     } else {
         vec![
-            key(" ↑/↓ "),
-            muted("Navigate   "),
-            key(" ←/→ "),
-            muted("Adjust   "),
-            key(" Shift+←/→ "),
-            muted("Fine   "),
-            key(" q "),
-            muted("Quit"),
+            key_chip("↑/↓"),
+            muted(" Navigate  "),
+            key_chip("←/→"),
+            muted(" Adjust  "),
+            key_chip("Shift+←/→"),
+            muted(" Fine  "),
+            key_chip("q"),
+            muted(" Quit"),
         ]
     };
     frame.render_widget(
@@ -827,10 +1245,13 @@ fn truncate_with_ellipsis(value: &str, width: usize) -> String {
     value.chars().take(width - 1).chain(['…']).collect()
 }
 
-fn key(label: &'static str) -> Span<'static> {
+fn key_chip(label: &'static str) -> Span<'static> {
     Span::styled(
-        label,
-        Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
+        format!(" {label} "),
+        Style::default()
+            .fg(ACCENT)
+            .add_modifier(Modifier::BOLD)
+            .add_modifier(Modifier::REVERSED),
     )
 }
 
@@ -904,6 +1325,8 @@ fn adjust_time(value: &mut String, direction: i16, step: i16) {
     }
 }
 
+// ── tests ────────────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use chrono::Local;
@@ -970,10 +1393,75 @@ mod tests {
     }
 
     #[test]
+    fn timeline_segments_match_default_schedule() {
+        let schedule = Schedule::default();
+        let view = TimelineView::from_schedule(&schedule, 12 * 60).unwrap();
+
+        // Midday is day.
+        assert_eq!(view.phase_at(12 * 60), TimelinePhase::Day);
+        // During evening fade (21:00–21:30).
+        assert_eq!(view.phase_at(21 * 60 + 10), TimelinePhase::EveningFade);
+        // Late night is night.
+        assert_eq!(view.phase_at(23 * 60), TimelinePhase::Night);
+        // Early morning still night.
+        assert_eq!(view.phase_at(2 * 60), TimelinePhase::Night);
+        // Morning fade (07:00–07:30).
+        assert_eq!(view.phase_at(7 * 60 + 10), TimelinePhase::MorningFade);
+        // After morning fade is day.
+        assert_eq!(view.phase_at(8 * 60), TimelinePhase::Day);
+    }
+
+    #[test]
+    fn timeline_supports_instant_transitions() {
+        let schedule = Schedule {
+            transition_minutes: 0,
+            ..Schedule::default()
+        };
+        let view = TimelineView::from_schedule(&schedule, 0).unwrap();
+        assert_eq!(view.phase_at(21 * 60), TimelinePhase::Night);
+        assert_eq!(view.phase_at(7 * 60), TimelinePhase::Day);
+        assert_eq!(view.phase_at(6 * 60 + 59), TimelinePhase::Night);
+    }
+
+    #[test]
+    fn timeline_covers_full_day_without_gaps() {
+        let segments = build_timeline_segments(7 * 60, 21 * 60, 30);
+        assert!(!segments.is_empty());
+        assert_eq!(segments.first().unwrap().start, 0);
+        assert_eq!(segments.last().unwrap().end, MINUTES_PER_DAY);
+        for window in segments.windows(2) {
+            assert_eq!(window[0].end, window[1].start);
+        }
+        let covered: u16 = segments.iter().map(|s| s.end - s.start).sum();
+        assert_eq!(covered, MINUTES_PER_DAY);
+    }
+
+    #[test]
+    fn timeline_bar_includes_now_marker() {
+        let schedule = Schedule::default();
+        let view = TimelineView::from_schedule(&schedule, 12 * 60).unwrap();
+        let line = render_timeline_bar(48, &view, true);
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(text.chars().count(), 48);
+        // Now is a same-glyph column with a distinct background, not a special icon.
+        let now_styled = line.spans.iter().any(|span| {
+            span.content.as_ref() == "█"
+                && span.style.bg == Some(COOL)
+                && span.style.fg == Some(NOW)
+        });
+        assert!(now_styled, "expected color-highlighted now column in bar");
+        assert!(!text.contains('◆'));
+    }
+
+    #[test]
     fn dashboard_renders_full_and_compact_terminal_states() {
         let app = App::new(test_state(Settings::default()), false);
 
-        let mut terminal = Terminal::new(TestBackend::new(120, 36)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         terminal.draw(|frame| app.render(frame)).unwrap();
         let rendered = buffer_text(&terminal);
         assert!(rendered.contains("WAYWARM"));
@@ -981,6 +1469,8 @@ mod tests {
         assert!(rendered.contains("MANUAL OVERRIDE"));
         assert!(rendered.contains("Fade duration"));
         assert!(rendered.contains("HELP"));
+        assert!(rendered.contains("CONTROLS"));
+        assert!(rendered.contains("TODAY"));
         assert!(rendered.contains("→ Mode"));
         assert!(!rendered.contains("› Schedule"));
 
@@ -989,6 +1479,7 @@ mod tests {
         let rendered = buffer_text(&compact);
         assert!(rendered.contains("Fade duration"));
         assert!(rendered.contains("Connected service"));
+        assert!(rendered.contains("TODAY"));
         assert!(!rendered.contains("at least"));
         assert!(!rendered.contains("HELP"));
 
@@ -1009,8 +1500,8 @@ mod tests {
         terminal.draw(|frame| app.render(frame)).unwrap();
         let rendered = buffer_text(&terminal);
 
-        assert!(rendered.contains("[AUTOMATIC]"));
-        assert!(rendered.contains("[OFF]"));
+        assert!(rendered.contains("AUTOMATIC"));
+        assert!(rendered.contains("OFF"));
     }
 
     #[test]
@@ -1032,15 +1523,38 @@ mod tests {
     #[test]
     fn dashboard_uses_only_the_supported_terminal_colors() {
         let app = App::new(test_state(Settings::default()), false);
-        let mut terminal = Terminal::new(TestBackend::new(120, 36)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         terminal.draw(|frame| app.render(frame)).unwrap();
 
         for cell in terminal.backend().buffer().content() {
-            assert!(matches!(
-                cell.fg,
-                Color::Reset | Color::White | Color::Yellow | Color::Gray | Color::DarkGray
-            ));
-            assert_eq!(cell.bg, Color::Reset);
+            assert!(
+                matches!(
+                    cell.fg,
+                    Color::Reset
+                        | Color::White
+                        | Color::Yellow
+                        | Color::LightYellow
+                        | Color::Cyan
+                        | Color::Gray
+                        | Color::DarkGray
+                ),
+                "unexpected fg color: {:?}",
+                cell.fg
+            );
+            assert!(
+                matches!(
+                    cell.bg,
+                    Color::Reset
+                        | Color::White
+                        | Color::Yellow
+                        | Color::LightYellow
+                        | Color::Cyan
+                        | Color::Gray
+                        | Color::DarkGray
+                ),
+                "unexpected bg color: {:?}",
+                cell.bg
+            );
         }
     }
 

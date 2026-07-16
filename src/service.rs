@@ -52,6 +52,14 @@ impl ServiceManager {
         }
     }
 
+    pub fn binary_path(&self) -> &Path {
+        &self.binary_path
+    }
+
+    pub fn unit_path(&self) -> &Path {
+        &self.unit_path
+    }
+
     pub fn install_and_start(&self) -> Result<()> {
         retire_legacy_service()?;
         let source = env::current_exe().context("failed to locate the running executable")?;
