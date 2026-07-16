@@ -86,6 +86,28 @@ Use arrow keys or `h`/`j`/`k`/`l` to navigate and adjust values. Press
 `Space` or `Enter` to toggle options, and `q` or `Esc` to quit. Changes are
 applied and saved immediately.
 
+## CLI
+
+Scriptable commands talk to a running daemon (the optional service, or an open
+settings UI). They fail clearly if nothing is listening.
+
+```console
+waywarm status
+waywarm status --json
+waywarm toggle
+waywarm enable
+waywarm disable
+waywarm set --warmth 40 --brightness 90
+waywarm set --mode automatic
+waywarm set --night-start 21:30 --transition 45
+```
+
+`set` updates and saves configuration the same way as the TUI. Manual
+`--warmth` / `--brightness` switch into enabled manual mode unless you also
+pass `--mode`. Use `--json` on `status`, `set`, `enable`, `disable`, or
+`toggle` for machine-readable output (`RuntimeState` fields may grow over
+time).
+
 ## License
 
 [MIT](LICENSE)
