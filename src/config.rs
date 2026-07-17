@@ -1,4 +1,4 @@
-use std::{env, fs, io::Write, path::PathBuf};
+use std::{collections::BTreeMap, env, fs, io::Write, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -129,6 +129,38 @@ pub struct Settings {
     pub automatic: bool,
     pub manual: Levels,
     pub schedule: Schedule,
+    /// Named snapshots of automatic/manual/schedule (filter enable is separate).
+    #[serde(default)]
+    pub presets: BTreeMap<String, Preset>,
+}
+
+/// A reusable filter profile that does not include the on/off toggle.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Preset {
+    pub automatic: bool,
+    pub manual: Levels,
+    pub schedule: Schedule,
+}
+
+impl Preset {
+    pub fn from_settings(settings: &Settings) -> Self {
+        Self {
+            automatic: settings.automatic,
+            manual: settings.manual,
+            schedule: settings.schedule.clone(),
+        }
+    }
+
+    pub fn apply_to(&self, settings: &mut Settings) {
+        settings.automatic = self.automatic;
+        settings.manual = self.manual;
+        settings.schedule = self.schedule.clone();
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.manual.validate()?;
+        self.schedule.validate()
+    }
 }
 
 impl Default for Settings {
@@ -142,6 +174,7 @@ impl Default for Settings {
                 brightness: 90,
             },
             schedule: Schedule::default(),
+            presets: BTreeMap::new(),
         }
     }
 }
@@ -156,7 +189,50 @@ impl Settings {
             );
         }
         self.manual.validate()?;
-        self.schedule.validate()
+        self.schedule.validate()?;
+        for (name, preset) in &self.presets {
+            if name.trim().is_empty() {
+                bail!("preset names must not be empty");
+            }
+            if name.chars().any(|c| c.is_control()) {
+                bail!("preset name {name:?} contains invalid characters");
+            }
+            preset
+                .validate()
+                .with_context(|| format!("invalid preset {name:?}"))?;
+        }
+        Ok(())
+    }
+
+    pub fn save_preset(&mut self, name: impl Into<String>) -> Result<()> {
+        let name = name.into();
+        if name.trim().is_empty() {
+            bail!("preset name must not be empty");
+        }
+        if name.chars().any(|c| c.is_control()) {
+            bail!("preset name contains invalid characters");
+        }
+        let preset = Preset::from_settings(self);
+        preset.validate()?;
+        self.presets.insert(name, preset);
+        Ok(())
+    }
+
+    pub fn apply_preset(&mut self, name: &str) -> Result<()> {
+        let preset = self
+            .presets
+            .get(name)
+            .with_context(|| format!("unknown preset {name:?}"))?
+            .clone();
+        preset.apply_to(self);
+        Ok(())
+    }
+
+    pub fn delete_preset(&mut self, name: &str) -> Result<()> {
+        if self.presets.remove(name).is_none() {
+            bail!("unknown preset {name:?}");
+        }
+        Ok(())
     }
 }
 
@@ -317,5 +393,28 @@ brightness = 90
         settings.schedule.timing = ScheduleTiming::Location;
         settings.schedule.latitude = 100.0;
         assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn preset_save_apply_and_delete() {
+        let mut settings = Settings::default();
+        settings.manual.warmth = 70;
+        settings.save_preset("reading").unwrap();
+        assert!(settings.presets.contains_key("reading"));
+
+        settings.manual.warmth = 10;
+        settings.apply_preset("reading").unwrap();
+        assert_eq!(settings.manual.warmth, 70);
+
+        settings.delete_preset("reading").unwrap();
+        assert!(settings.presets.is_empty());
+        assert!(settings.apply_preset("reading").is_err());
+    }
+
+    #[test]
+    fn rejects_empty_preset_names() {
+        let mut settings = Settings::default();
+        assert!(settings.save_preset("").is_err());
+        assert!(settings.save_preset("   ").is_err());
     }
 }

@@ -9,7 +9,7 @@ fn main() -> Result<()> {
             waywarm::service::retire_legacy_service()?;
             waywarm::daemon::run()
         }
-        Some(command @ ("status" | "set" | "enable" | "disable" | "toggle")) => {
+        Some(command @ ("status" | "set" | "enable" | "disable" | "toggle" | "preset")) => {
             waywarm::cli::run(command, arguments)
         }
         Some("--help" | "-h" | "help") if arguments.len() == 0 => {
@@ -30,6 +30,7 @@ Usage:
   waywarm daemon          Manage the optional background service
   waywarm status [--json] Show filter state (requires a running daemon)
   waywarm enable|disable|toggle [--json]
+  waywarm preset list|save|apply|delete
   waywarm set [options]   Change settings from scripts
   waywarm --daemon        Internal service process
   waywarm --help          Show this help

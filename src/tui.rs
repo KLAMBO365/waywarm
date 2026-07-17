@@ -43,11 +43,12 @@ const NOW: Color = Color::White;
 
 // ── fields ───────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
 enum Field {
     Mode,
     Filter,
+    Preset,
     ManualWarmth,
     ManualBrightness,
     Timing,
@@ -63,9 +64,10 @@ enum Field {
 }
 
 impl Field {
-    const ALL: [Self; 14] = [
+    const ALL: [Self; 15] = [
         Self::Mode,
         Self::Filter,
+        Self::Preset,
         Self::ManualWarmth,
         Self::ManualBrightness,
         Self::Timing,
@@ -96,10 +98,10 @@ impl Field {
     /// Map a field onto its row in the settings list (including group headers / spacers).
     ///
     /// Layout without leading blank:
-    /// GENERAL, Mode, Filter, [blank], MANUAL…, Warmth, Brightness, [blank], SCHEDULE…
+    /// GENERAL, Mode, Filter, Preset, [blank], MANUAL…, Warmth, Brightness, [blank], SCHEDULE…
     fn row_index(self, spacious: bool) -> usize {
         match (self, spacious) {
-            (Self::Mode | Self::Filter, _) => self.index() + 1,
+            (Self::Mode | Self::Filter | Self::Preset, _) => self.index() + 1,
             (Self::ManualWarmth | Self::ManualBrightness, false) => self.index() + 2,
             (Self::ManualWarmth | Self::ManualBrightness, true) => self.index() + 3,
             (_, false) => self.index() + 3,
@@ -108,7 +110,10 @@ impl Field {
     }
 
     fn is_toggle(self) -> bool {
-        matches!(self, Self::Mode | Self::Filter | Self::Timing)
+        matches!(
+            self,
+            Self::Mode | Self::Filter | Self::Timing | Self::Preset
+        )
     }
 }
 
@@ -298,6 +303,8 @@ fn connect_or_start() -> Result<(RuntimeState, Option<TransientBackend>)> {
 struct App {
     state: RuntimeState,
     selected: Field,
+    /// Currently highlighted preset name for apply (Enter).
+    preset_cursor: Option<String>,
     notice: Option<Notice>,
     transient: bool,
     backend_available: bool,
@@ -349,14 +356,25 @@ impl Notice {
 
 impl App {
     fn new(state: RuntimeState, transient: bool) -> Self {
+        let preset_cursor = state.settings.presets.keys().next().cloned();
         Self {
             state,
             selected: Field::Mode,
+            preset_cursor,
             notice: None,
             transient,
             backend_available: true,
             last_refresh: Instant::now(),
         }
+    }
+
+    fn sync_preset_cursor(&mut self) {
+        if let Some(name) = &self.preset_cursor
+            && self.state.settings.presets.contains_key(name)
+        {
+            return;
+        }
+        self.preset_cursor = self.state.settings.presets.keys().next().cloned();
     }
 
     fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
@@ -374,6 +392,7 @@ impl App {
                 match query_state() {
                     Ok(state) => {
                         self.state = state;
+                        self.sync_preset_cursor();
                         if !self.backend_available {
                             self.notice = Some(Notice::reconnected());
                         }
@@ -421,8 +440,59 @@ impl App {
                     ScheduleTiming::Location => ScheduleTiming::Fixed,
                 };
             }),
+            Field::Preset => self.apply_selected_preset(),
             _ => Ok(()),
         }
+    }
+
+    fn apply_selected_preset(&mut self) -> Result<()> {
+        self.sync_preset_cursor();
+        let Some(name) = self.preset_cursor.clone() else {
+            self.notice = Some(Notice::error(
+                "No presets yet — save one with `waywarm preset save <name>`".into(),
+            ));
+            return Ok(());
+        };
+        let mut settings = self.state.settings.clone();
+        if let Err(error) = settings.apply_preset(&name) {
+            self.notice = Some(Notice::error(format!("Could not apply preset: {error:#}")));
+            return Ok(());
+        }
+        if settings == self.state.settings {
+            return Ok(());
+        }
+        match replace_settings(settings) {
+            Ok(state) => {
+                self.state = state;
+                self.sync_preset_cursor();
+                self.backend_available = true;
+                self.notice = Some(Notice::saved());
+            }
+            Err(error) => {
+                self.notice = Some(Notice::error(format!("Settings not saved: {error:#}")))
+            }
+        }
+        self.last_refresh = Instant::now();
+        Ok(())
+    }
+
+    fn cycle_preset_cursor(&mut self, direction: i16) {
+        let names: Vec<_> = self.state.settings.presets.keys().cloned().collect();
+        if names.is_empty() {
+            self.preset_cursor = None;
+            return;
+        }
+        let current = self
+            .preset_cursor
+            .as_ref()
+            .and_then(|name| names.iter().position(|n| n == name))
+            .unwrap_or(0);
+        let next = if direction >= 0 {
+            (current + 1) % names.len()
+        } else {
+            current.checked_sub(1).unwrap_or(names.len() - 1)
+        };
+        self.preset_cursor = Some(names[next].clone());
     }
 
     fn adjust(&mut self, direction: i16, modifiers: KeyModifiers) -> Result<()> {
@@ -430,10 +500,15 @@ impl App {
         let percent_step = if fine { 1 } else { 5 };
         let time_step = if fine { 1 } else { 15 };
         let coord_step = if fine { 0.1 } else { 1.0 };
+        if self.selected == Field::Preset {
+            self.cycle_preset_cursor(direction);
+            return Ok(());
+        }
         let selected = self.selected;
         self.edit(move |settings| match selected {
             Field::Filter => set_filter(settings, direction > 0),
             Field::Mode => settings.automatic = direction > 0,
+            Field::Preset => {}
             Field::Timing => {
                 settings.schedule.timing = if direction > 0 {
                     ScheduleTiming::Location
@@ -522,6 +597,7 @@ impl App {
         match replace_settings(settings) {
             Ok(state) => {
                 self.state = state;
+                self.sync_preset_cursor();
                 self.backend_available = true;
                 self.notice = Some(Notice::saved());
             }
@@ -582,7 +658,13 @@ impl App {
         self.render_header(frame, areas.header);
         self.render_metrics(frame, areas.metrics, areas.compact);
         self.render_timeline(frame, areas.timeline, areas.compact);
-        render_settings(frame, areas.settings, &self.state.settings, self.selected);
+        render_settings(
+            frame,
+            areas.settings,
+            &self.state.settings,
+            self.selected,
+            self.preset_cursor.as_deref(),
+        );
 
         if let Some(help_area) = areas.help {
             let (selected_name, selected_help) = selected_help(self.selected);
@@ -1079,7 +1161,13 @@ fn render_metric(
     );
 }
 
-fn render_settings(frame: &mut Frame, area: Rect, settings: &Settings, selected: Field) {
+fn render_settings(
+    frame: &mut Frame,
+    area: Rect,
+    settings: &Settings,
+    selected: Field,
+    preset_cursor: Option<&str>,
+) {
     let block = panel_block(" CONTROLS ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -1088,6 +1176,8 @@ fn render_settings(frame: &mut Frame, area: Rect, settings: &Settings, selected:
     let schedule_active = settings.enabled && settings.automatic;
     let location_active = schedule_active && settings.schedule.timing == ScheduleTiming::Location;
     let fixed_times_active = schedule_active && settings.schedule.timing == ScheduleTiming::Fixed;
+    let has_presets = !settings.presets.is_empty();
+    let preset_label = preset_cursor.unwrap_or("(none)");
     let mode = if settings.automatic {
         "AUTOMATIC"
     } else {
@@ -1097,8 +1187,8 @@ fn render_settings(frame: &mut Frame, area: Rect, settings: &Settings, selected:
         ScheduleTiming::Fixed => "FIXED",
         ScheduleTiming::Location => "LOCATION",
     };
-    // Compact lists need every row: 3 group headers + 14 fields = 17 lines.
-    let spacious = inner.height >= 19;
+    // Compact lists need every row: 3 group headers + 15 fields = 18 lines.
+    let spacious = inner.height >= 20;
     let mut items = vec![
         group_item("GENERAL", true),
         value_item("Mode", mode, true, true, false),
@@ -1109,6 +1199,7 @@ fn render_settings(frame: &mut Frame, area: Rect, settings: &Settings, selected:
             settings.enabled,
             false,
         ),
+        value_item("Preset", preset_label, has_presets, false, has_presets),
     ];
     if spacious {
         items.push(ListItem::new(""));
@@ -1344,6 +1435,10 @@ fn selected_help(selected: Field) -> (&'static str, &'static str) {
         Field::Filter => (
             "Filter",
             "Enable or disable color filtering. Turning it off restores neutral display colors.",
+        ),
+        Field::Preset => (
+            "Preset",
+            "Cycle saved presets with ←/→, then Enter to apply. Save new ones with `waywarm preset save`.",
         ),
         Field::Mode => (
             "Mode",

@@ -5,7 +5,7 @@ use crate::config::Settings;
 /// Bump when the settings/runtime shape the daemon must understand changes.
 /// Clients and daemons with mismatched versions refuse to talk so upgrades
 /// cannot silently drop fields (for example day schedule levels).
-pub const IPC_VERSION: u32 = 3;
+pub const IPC_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

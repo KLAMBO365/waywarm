@@ -17,6 +17,7 @@ pub fn run(command: &str, args: impl IntoIterator<Item = String>) -> Result<()> 
         "enable" => set_enabled(true, &args),
         "disable" => set_enabled(false, &args),
         "toggle" => toggle(&args),
+        "preset" => preset(&args),
         _ => bail!("unknown CLI command {command:?}; use --help"),
     }
 }
@@ -99,6 +100,111 @@ fn toggle(args: &[String]) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&state)?);
     }
     Ok(())
+}
+
+fn preset(args: &[String]) -> Result<()> {
+    if args.is_empty() || matches!(args[0].as_str(), "--help" | "-h") {
+        println!("{}", command_help("preset"));
+        return Ok(());
+    }
+    let action = args[0].as_str();
+    let rest = &args[1..];
+    match action {
+        "list" => preset_list(rest),
+        "save" => preset_save(rest),
+        "apply" => preset_apply(rest),
+        "delete" | "rm" => preset_delete(rest),
+        other => bail!("unknown preset action {other:?}; use `waywarm preset --help`"),
+    }
+}
+
+fn preset_list(args: &[String]) -> Result<()> {
+    let mut json = false;
+    for arg in args {
+        match arg.as_str() {
+            "--json" => json = true,
+            "--help" | "-h" => {
+                println!("{}", command_help("preset"));
+                return Ok(());
+            }
+            other => bail!("unexpected argument {other:?} for `preset list`"),
+        }
+    }
+    let state = query_state().map_err(daemon_hint)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&state.settings.presets)?);
+        return Ok(());
+    }
+    if state.settings.presets.is_empty() {
+        println!("(no presets)");
+        return Ok(());
+    }
+    for name in state.settings.presets.keys() {
+        println!("{name}");
+    }
+    Ok(())
+}
+
+fn preset_save(args: &[String]) -> Result<()> {
+    let Some((name, json)) = parse_preset_name_args(args)? else {
+        println!("{}", command_help("preset"));
+        return Ok(());
+    };
+    let mut state = query_state().map_err(daemon_hint)?;
+    state.settings.save_preset(name)?;
+    let state = replace_settings(state.settings).map_err(daemon_hint)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&state)?);
+    }
+    Ok(())
+}
+
+fn preset_apply(args: &[String]) -> Result<()> {
+    let Some((name, json)) = parse_preset_name_args(args)? else {
+        println!("{}", command_help("preset"));
+        return Ok(());
+    };
+    let mut state = query_state().map_err(daemon_hint)?;
+    state.settings.apply_preset(&name)?;
+    let state = replace_settings(state.settings).map_err(daemon_hint)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&state)?);
+    }
+    Ok(())
+}
+
+fn preset_delete(args: &[String]) -> Result<()> {
+    let Some((name, json)) = parse_preset_name_args(args)? else {
+        println!("{}", command_help("preset"));
+        return Ok(());
+    };
+    let mut state = query_state().map_err(daemon_hint)?;
+    state.settings.delete_preset(&name)?;
+    let state = replace_settings(state.settings).map_err(daemon_hint)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&state)?);
+    }
+    Ok(())
+}
+
+/// Returns `None` when help was requested.
+fn parse_preset_name_args(args: &[String]) -> Result<Option<(String, bool)>> {
+    let mut name = None;
+    let mut json = false;
+    for arg in args {
+        match arg.as_str() {
+            "--json" => json = true,
+            "--help" | "-h" => return Ok(None),
+            other if other.starts_with('-') => {
+                bail!("unexpected argument {other:?}")
+            }
+            other if name.is_none() => name = Some(other.to_owned()),
+            other => bail!("unexpected argument {other:?}"),
+        }
+    }
+    let name =
+        name.ok_or_else(|| anyhow::anyhow!("missing preset name; see `waywarm preset --help`"))?;
+    Ok(Some((name, json)))
 }
 
 fn daemon_hint(error: anyhow::Error) -> anyhow::Error {
@@ -379,6 +485,16 @@ fn format_status_human(state: &RuntimeState) -> String {
             settings.schedule.day_start
         ),
     };
+    let presets = if settings.presets.is_empty() {
+        "(none)".into()
+    } else {
+        settings
+            .presets
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     let outputs = if state.outputs.is_empty() {
         "(none)".into()
     } else {
@@ -392,6 +508,7 @@ fn format_status_human(state: &RuntimeState) -> String {
          Day:        {}\n\
          Night:      {}\n\
          Schedule:   {timing} · fade {}m\n\
+         Presets:    {presets}\n\
          Backend:    {}\n\
          Outputs:    {outputs}\n",
         format_levels_line(state.active_warmth, state.active_brightness),
@@ -417,6 +534,16 @@ fn command_help(command: &str) -> String {
         "enable" => "Usage: waywarm enable [--json]".into(),
         "disable" => "Usage: waywarm disable [--json]".into(),
         "toggle" => "Usage: waywarm toggle [--json]".into(),
+        "preset" => "Usage: waywarm preset <action> [name] [--json]\n\n\
+Actions:\n\
+  list                 List saved preset names\n\
+  save <name>          Save current levels/schedule as a preset\n\
+  apply <name>         Apply a saved preset (keeps filter on/off)\n\
+  delete <name>        Remove a preset (alias: rm)\n\
+\n\
+Presets store automatic/manual mode, levels, and schedule — not the filter\n\
+enable toggle. Requires a running Waywarm daemon."
+            .into(),
         "set" => "Usage: waywarm set [options]\n\n\
 Options:\n\
   --on | --off                 Enable or disable the filter\n\
@@ -583,6 +710,7 @@ mod tests {
         assert!(text.contains("Active:"));
         assert!(text.contains("Day:"));
         assert!(text.contains("Night:"));
+        assert!(text.contains("Presets:"));
         assert!(text.contains("warmth 25%"));
         assert!(text.contains("eDP-1, HDMI-A-1"));
         assert!(text.contains("wlr-gamma-control-v1"));
