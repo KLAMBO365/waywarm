@@ -500,7 +500,7 @@ fn format_status_human(state: &RuntimeState) -> String {
     } else {
         state.outputs.join(", ")
     };
-    format!(
+    let mut text = format!(
         "Filter:     {filter}\n\
          Mode:       {mode}\n\
          Active:     {}\n\
@@ -517,7 +517,11 @@ fn format_status_human(state: &RuntimeState) -> String {
         format_levels(settings.schedule.night),
         settings.schedule.transition_minutes,
         state.backend,
-    )
+    );
+    if let Some(conflict) = &state.conflict {
+        text.push_str(&format!("Conflict:   {conflict}\n"));
+    }
+    text
 }
 
 fn format_levels(levels: Levels) -> String {
@@ -703,6 +707,7 @@ mod tests {
             backend: "wlr-gamma-control-v1".into(),
             active_warmth: 25,
             active_brightness: 95,
+            conflict: None,
         };
         let text = format_status_human(&state);
         assert!(text.contains("Filter:"));

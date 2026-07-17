@@ -83,7 +83,8 @@ GNOME, KDE Plasma, and newer Hyprland versions are not supported.
 
 > [!IMPORTANT]
 > Gamma control is exclusive. Stop `gammastep`, `wlsunset`, or similar tools
-> before starting Waywarm.
+> before starting Waywarm. The daemon reports competing clients and failed
+> outputs in `waywarm status` and the settings UI.
 
 ## Configuration
 

@@ -5,7 +5,7 @@ use crate::config::Settings;
 /// Bump when the settings/runtime shape the daemon must understand changes.
 /// Clients and daemons with mismatched versions refuse to talk so upgrades
 /// cannot silently drop fields (for example day schedule levels).
-pub const IPC_VERSION: u32 = 4;
+pub const IPC_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -21,6 +21,9 @@ pub struct RuntimeState {
     pub backend: String,
     pub active_warmth: u8,
     pub active_brightness: u8,
+    /// Present when another gamma client is detected or outputs reject control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

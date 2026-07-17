@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod config;
+pub mod conflict;
 pub mod daemon;
 pub mod gamma;
 pub mod ipc;

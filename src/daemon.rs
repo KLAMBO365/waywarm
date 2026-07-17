@@ -29,6 +29,7 @@ use wayland_protocols_wlr::gamma_control::v1::client::{
 
 use crate::{
     config::{ConfigStore, Levels, Settings},
+    conflict::{competing_gamma_processes, conflict_message},
     gamma::gamma_ramps,
     ipc::{prepare_runtime_dir, socket_path},
     protocol::{IPC_VERSION, Request, Response, RuntimeState},
@@ -60,6 +61,7 @@ struct DaemonState {
     settings: Settings,
     store: ConfigStore,
     active: Levels,
+    conflict: Option<String>,
 }
 
 impl DaemonState {
@@ -67,6 +69,17 @@ impl DaemonState {
         self.outputs
             .iter_mut()
             .find(|output| output.global_name == global_name)
+    }
+
+    fn refresh_conflict(&mut self) {
+        let failed: Vec<String> = self
+            .outputs
+            .iter()
+            .filter(|output| output.failed)
+            .map(|output| output.name.clone())
+            .collect();
+        let competitors = competing_gamma_processes();
+        self.conflict = conflict_message(&failed, &competitors);
     }
 
     fn add_output(
@@ -110,6 +123,7 @@ impl DaemonState {
     }
 
     fn refresh_active(&mut self) -> Result<()> {
+        self.refresh_conflict();
         let next = current_levels(&self.settings, Local::now())?;
         if next != self.active {
             self.active = next;
@@ -159,6 +173,7 @@ impl DaemonState {
             backend: "wlr-gamma-control-v1".into(),
             active_warmth: self.active.warmth,
             active_brightness: self.active.brightness,
+            conflict: self.conflict.clone(),
         }
     }
 }
@@ -233,6 +248,7 @@ fn run_until(terminating: Arc<AtomicBool>) -> Result<()> {
         settings,
         store,
         active,
+        conflict: None,
     };
     for global in globals.contents().clone_list() {
         if global.interface == wl_output::WlOutput::interface().name {
@@ -240,6 +256,7 @@ fn run_until(terminating: Arc<AtomicBool>) -> Result<()> {
         }
     }
     event_queue.roundtrip(&mut state)?;
+    state.refresh_conflict();
     state.apply_all()?;
 
     while !terminating.load(Ordering::Relaxed) {
@@ -447,6 +464,7 @@ impl Dispatch<ZwlrGammaControlV1, u32> for DaemonState {
                 if let Some(output) = state.output_mut(*global_name) {
                     output.failed = true;
                 }
+                state.refresh_conflict();
             }
             _ => {}
         }

@@ -395,6 +395,15 @@ impl App {
                         self.sync_preset_cursor();
                         if !self.backend_available {
                             self.notice = Some(Notice::reconnected());
+                        } else if let Some(conflict) = &self.state.conflict {
+                            let text = format!("Conflict: {conflict}");
+                            let already = self
+                                .notice
+                                .as_ref()
+                                .is_some_and(|notice| notice.text == text);
+                            if !already {
+                                self.notice = Some(Notice::error(text));
+                            }
                         }
                         self.backend_available = true;
                     }
@@ -1782,6 +1791,7 @@ mod tests {
             backend: "test".into(),
             active_warmth: 50,
             active_brightness: 90,
+            conflict: None,
         }
     }
 
