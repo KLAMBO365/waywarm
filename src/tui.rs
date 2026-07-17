@@ -300,11 +300,18 @@ fn connect_or_start() -> Result<(RuntimeState, Option<TransientBackend>)> {
 
 // ── app state ────────────────────────────────────────────────────────────────
 
+enum PresetUi {
+    Browse,
+    Naming { buffer: String },
+    ConfirmDelete { name: String },
+}
+
 struct App {
     state: RuntimeState,
     selected: Field,
-    /// Currently highlighted preset name for apply (Enter).
+    /// Currently highlighted preset name for apply / overwrite / delete.
     preset_cursor: Option<String>,
+    preset_ui: PresetUi,
     notice: Option<Notice>,
     transient: bool,
     backend_available: bool,
@@ -337,6 +344,14 @@ impl Notice {
         }
     }
 
+    fn info(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            error: false,
+            expires_at: Some(Instant::now() + Duration::from_secs(3)),
+        }
+    }
+
     fn reconnected() -> Self {
         Self {
             text: "Display backend reconnected".into(),
@@ -361,6 +376,7 @@ impl App {
             state,
             selected: Field::Mode,
             preset_cursor,
+            preset_ui: PresetUi::Browse,
             notice: None,
             transient,
             backend_available: true,
@@ -395,7 +411,9 @@ impl App {
                         self.sync_preset_cursor();
                         if !self.backend_available {
                             self.notice = Some(Notice::reconnected());
-                        } else if let Some(conflict) = &self.state.conflict {
+                        } else if matches!(self.preset_ui, PresetUi::Browse)
+                            && let Some(conflict) = &self.state.conflict
+                        {
                             let text = format!("Conflict: {conflict}");
                             let already = self
                                 .notice
@@ -420,6 +438,12 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
+        match &self.preset_ui {
+            PresetUi::Naming { .. } => return self.handle_preset_naming_key(key),
+            PresetUi::ConfirmDelete { .. } => return self.handle_preset_delete_key(key),
+            PresetUi::Browse => {}
+        }
+
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
             KeyCode::Up | KeyCode::Char('k') => {
@@ -434,9 +458,140 @@ impl App {
             KeyCode::Left | KeyCode::Char('h') => self.adjust(-1, key.modifiers)?,
             KeyCode::Right | KeyCode::Char('l') => self.adjust(1, key.modifiers)?,
             KeyCode::Enter | KeyCode::Char(' ') => self.toggle()?,
+            KeyCode::Char('s') if self.selected == Field::Preset => self.begin_preset_save(),
+            KeyCode::Char('d') | KeyCode::Delete if self.selected == Field::Preset => {
+                self.begin_preset_delete();
+            }
             _ => {}
         }
         Ok(false)
+    }
+
+    fn handle_preset_naming_key(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Esc => {
+                self.preset_ui = PresetUi::Browse;
+                self.notice = Some(Notice::info("Preset save cancelled"));
+            }
+            KeyCode::Enter => self.commit_preset_save()?,
+            KeyCode::Backspace => {
+                if let PresetUi::Naming { buffer } = &mut self.preset_ui {
+                    buffer.pop();
+                }
+            }
+            KeyCode::Char(c) if is_preset_name_char(c) => {
+                if let PresetUi::Naming { buffer } = &mut self.preset_ui
+                    && buffer.chars().count() < 32
+                {
+                    buffer.push(c);
+                }
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn handle_preset_delete_key(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.preset_ui = PresetUi::Browse;
+                self.notice = Some(Notice::info("Preset delete cancelled"));
+            }
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char(' ') => {
+                self.commit_preset_delete()?;
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn begin_preset_save(&mut self) {
+        let buffer = self.preset_cursor.clone().unwrap_or_default();
+        self.preset_ui = PresetUi::Naming { buffer };
+        self.notice = Some(Notice {
+            text: "Type a preset name, Enter to save, Esc to cancel".into(),
+            error: false,
+            expires_at: None,
+        });
+    }
+
+    fn begin_preset_delete(&mut self) {
+        self.sync_preset_cursor();
+        let Some(name) = self.preset_cursor.clone() else {
+            self.notice = Some(Notice::error(
+                "No preset selected — save one with s first".into(),
+            ));
+            return;
+        };
+        self.preset_ui = PresetUi::ConfirmDelete { name: name.clone() };
+        self.notice = Some(Notice {
+            text: format!("Delete preset {name:?}? Enter/y confirm · Esc/n cancel"),
+            error: true,
+            expires_at: None,
+        });
+    }
+
+    fn commit_preset_save(&mut self) -> Result<()> {
+        let PresetUi::Naming { buffer } = &self.preset_ui else {
+            return Ok(());
+        };
+        let name = buffer.trim().to_owned();
+        if name.is_empty() {
+            self.notice = Some(Notice::error("Preset name must not be empty".into()));
+            return Ok(());
+        }
+        if !name.chars().all(is_preset_name_char) {
+            self.notice = Some(Notice::error(
+                "Preset names may use letters, digits, - and _".into(),
+            ));
+            return Ok(());
+        }
+        let mut settings = self.state.settings.clone();
+        if let Err(error) = settings.save_preset(name.clone()) {
+            self.notice = Some(Notice::error(format!("Could not save preset: {error:#}")));
+            return Ok(());
+        }
+        match replace_settings(settings) {
+            Ok(state) => {
+                self.state = state;
+                self.preset_cursor = Some(name.clone());
+                self.preset_ui = PresetUi::Browse;
+                self.backend_available = true;
+                self.notice = Some(Notice::info(format!("Preset {name:?} saved")));
+            }
+            Err(error) => {
+                self.notice = Some(Notice::error(format!("Settings not saved: {error:#}")))
+            }
+        }
+        self.last_refresh = Instant::now();
+        Ok(())
+    }
+
+    fn commit_preset_delete(&mut self) -> Result<()> {
+        let PresetUi::ConfirmDelete { name } = &self.preset_ui else {
+            return Ok(());
+        };
+        let name = name.clone();
+        let mut settings = self.state.settings.clone();
+        if let Err(error) = settings.delete_preset(&name) {
+            self.preset_ui = PresetUi::Browse;
+            self.notice = Some(Notice::error(format!("Could not delete preset: {error:#}")));
+            return Ok(());
+        }
+        match replace_settings(settings) {
+            Ok(state) => {
+                self.state = state;
+                self.sync_preset_cursor();
+                self.preset_ui = PresetUi::Browse;
+                self.backend_available = true;
+                self.notice = Some(Notice::info(format!("Preset {name:?} deleted")));
+            }
+            Err(error) => {
+                self.notice = Some(Notice::error(format!("Settings not saved: {error:#}")))
+            }
+        }
+        self.last_refresh = Instant::now();
+        Ok(())
     }
 
     fn toggle(&mut self) -> Result<()> {
@@ -458,7 +613,7 @@ impl App {
         self.sync_preset_cursor();
         let Some(name) = self.preset_cursor.clone() else {
             self.notice = Some(Notice::error(
-                "No presets yet — save one with `waywarm preset save <name>`".into(),
+                "No presets yet — press s to save the current settings".into(),
             ));
             return Ok(());
         };
@@ -468,6 +623,7 @@ impl App {
             return Ok(());
         }
         if settings == self.state.settings {
+            self.notice = Some(Notice::info(format!("Preset {name:?} already active")));
             return Ok(());
         }
         match replace_settings(settings) {
@@ -475,7 +631,7 @@ impl App {
                 self.state = state;
                 self.sync_preset_cursor();
                 self.backend_available = true;
-                self.notice = Some(Notice::saved());
+                self.notice = Some(Notice::info(format!("Applied preset {name:?}")));
             }
             Err(error) => {
                 self.notice = Some(Notice::error(format!("Settings not saved: {error:#}")))
@@ -629,17 +785,41 @@ impl App {
         }
     }
 
-    fn notice_text(&self) -> (&str, bool) {
-        self.notice.as_ref().map_or_else(
-            || {
+    fn notice_text(&self) -> (String, bool) {
+        if let Some(notice) = &self.notice {
+            return (notice.text.clone(), notice.error);
+        }
+        match &self.preset_ui {
+            PresetUi::Naming { buffer } => (format!("Name: {buffer}█"), false),
+            PresetUi::ConfirmDelete { name } => (
+                format!("Delete preset {name:?}? Enter/y confirm · Esc/n cancel"),
+                true,
+            ),
+            PresetUi::Browse => {
                 if self.transient {
-                    ("Temporary session — changes last until exit", false)
+                    ("Temporary session — changes last until exit".into(), false)
                 } else {
-                    ("Connected service — changes save immediately", false)
+                    ("Connected service — changes save immediately".into(), false)
                 }
-            },
-            |notice| (notice.text.as_str(), notice.error),
-        )
+            }
+        }
+    }
+
+    fn preset_display_label(&self) -> String {
+        match &self.preset_ui {
+            PresetUi::Naming { buffer } => {
+                if buffer.is_empty() {
+                    "save: _".into()
+                } else {
+                    format!("save: {buffer}")
+                }
+            }
+            PresetUi::ConfirmDelete { name } => format!("delete: {name}?"),
+            PresetUi::Browse => self
+                .preset_cursor
+                .clone()
+                .unwrap_or_else(|| "(none)".into()),
+        }
     }
 
     fn render(&self, frame: &mut Frame) {
@@ -667,16 +847,28 @@ impl App {
         self.render_header(frame, areas.header);
         self.render_metrics(frame, areas.metrics, areas.compact);
         self.render_timeline(frame, areas.timeline, areas.compact);
+        let editing_preset = !matches!(self.preset_ui, PresetUi::Browse);
         render_settings(
             frame,
             areas.settings,
             &self.state.settings,
             self.selected,
-            self.preset_cursor.as_deref(),
+            &self.preset_display_label(),
+            editing_preset,
         );
 
         if let Some(help_area) = areas.help {
-            let (selected_name, selected_help) = selected_help(self.selected);
+            let (selected_name, selected_help) = match &self.preset_ui {
+                PresetUi::Naming { .. } => (
+                    "Save preset",
+                    "Type letters, digits, - or _. Enter saves the current mode, levels, and schedule.",
+                ),
+                PresetUi::ConfirmDelete { .. } => (
+                    "Delete preset",
+                    "Enter or y deletes the selected preset. Esc or n cancels.",
+                ),
+                PresetUi::Browse => selected_help(self.selected),
+            };
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled(
@@ -697,8 +889,8 @@ impl App {
         }
 
         let (notice, error) = self.notice_text();
-        render_notice(frame, areas.notice, notice, error);
-        render_footer(frame, areas.footer, self.selected);
+        render_notice(frame, areas.notice, &notice, error);
+        render_footer(frame, areas.footer, self.selected, &self.preset_ui);
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
@@ -1175,7 +1367,8 @@ fn render_settings(
     area: Rect,
     settings: &Settings,
     selected: Field,
-    preset_cursor: Option<&str>,
+    preset_label: &str,
+    editing_preset: bool,
 ) {
     let block = panel_block(" CONTROLS ");
     let inner = block.inner(area);
@@ -1186,7 +1379,6 @@ fn render_settings(
     let location_active = schedule_active && settings.schedule.timing == ScheduleTiming::Location;
     let fixed_times_active = schedule_active && settings.schedule.timing == ScheduleTiming::Fixed;
     let has_presets = !settings.presets.is_empty();
-    let preset_label = preset_cursor.unwrap_or("(none)");
     let mode = if settings.automatic {
         "AUTOMATIC"
     } else {
@@ -1208,7 +1400,13 @@ fn render_settings(
             settings.enabled,
             false,
         ),
-        value_item("Preset", preset_label, has_presets, false, has_presets),
+        value_item(
+            "Preset",
+            preset_label,
+            true,
+            editing_preset || has_presets,
+            has_presets && !editing_preset,
+        ),
     ];
     if spacious {
         items.push(ListItem::new(""));
@@ -1384,9 +1582,35 @@ fn render_notice(frame: &mut Frame, area: Rect, message: &str, error: bool) {
     );
 }
 
-fn render_footer(frame: &mut Frame, area: Rect, selected: Field) {
-    let controls = if selected.is_toggle() {
-        vec![
+fn render_footer(frame: &mut Frame, area: Rect, selected: Field, preset_ui: &PresetUi) {
+    let controls = match preset_ui {
+        PresetUi::Naming { .. } => vec![
+            key_chip("type"),
+            muted(" Name  "),
+            key_chip("Enter"),
+            muted(" Save  "),
+            key_chip("Esc"),
+            muted(" Cancel"),
+        ],
+        PresetUi::ConfirmDelete { .. } => vec![
+            key_chip("Enter/y"),
+            muted(" Delete  "),
+            key_chip("Esc/n"),
+            muted(" Cancel"),
+        ],
+        PresetUi::Browse if selected == Field::Preset => vec![
+            key_chip("←/→"),
+            muted(" Choose  "),
+            key_chip("Enter"),
+            muted(" Apply  "),
+            key_chip("s"),
+            muted(" Save  "),
+            key_chip("d"),
+            muted(" Delete  "),
+            key_chip("q"),
+            muted(" Quit"),
+        ],
+        PresetUi::Browse if selected.is_toggle() => vec![
             key_chip("↑/↓"),
             muted(" Navigate  "),
             key_chip("←/→"),
@@ -1395,9 +1619,8 @@ fn render_footer(frame: &mut Frame, area: Rect, selected: Field) {
             muted(" Toggle  "),
             key_chip("q"),
             muted(" Quit"),
-        ]
-    } else {
-        vec![
+        ],
+        PresetUi::Browse => vec![
             key_chip("↑/↓"),
             muted(" Navigate  "),
             key_chip("←/→"),
@@ -1406,7 +1629,7 @@ fn render_footer(frame: &mut Frame, area: Rect, selected: Field) {
             muted(" Fine  "),
             key_chip("q"),
             muted(" Quit"),
-        ]
+        ],
     };
     frame.render_widget(
         Paragraph::new(Line::from(controls)).alignment(Alignment::Center),
@@ -1447,7 +1670,7 @@ fn selected_help(selected: Field) -> (&'static str, &'static str) {
         ),
         Field::Preset => (
             "Preset",
-            "Cycle saved presets with ←/→, then Enter to apply. Save new ones with `waywarm preset save`.",
+            "←/→ choose, Enter apply, s save current settings, d delete. Names: letters, digits, - and _.",
         ),
         Field::Mode => (
             "Mode",
@@ -1531,6 +1754,10 @@ fn adjust_time(value: &mut String, direction: i16, step: i16) {
 
 fn adjust_coordinate(value: &mut f64, direction: i16, step: f64, minimum: f64, maximum: f64) {
     *value = (*value + f64::from(direction) * step).clamp(minimum, maximum);
+}
+
+fn is_preset_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_'
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -1744,6 +1971,41 @@ mod tests {
         let adjust_footer = buffer_text(&terminal);
         assert!(adjust_footer.contains("Fine"));
         assert!(!adjust_footer.contains("Toggle"));
+
+        app.selected = Field::Preset;
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let preset_footer = buffer_text(&terminal);
+        assert!(preset_footer.contains("Apply"));
+        assert!(preset_footer.contains("Save"));
+        assert!(preset_footer.contains("Delete"));
+    }
+
+    #[test]
+    fn preset_name_chars_are_restricted() {
+        assert!(is_preset_name_char('a'));
+        assert!(is_preset_name_char('Z'));
+        assert!(is_preset_name_char('9'));
+        assert!(is_preset_name_char('-'));
+        assert!(is_preset_name_char('_'));
+        assert!(!is_preset_name_char(' '));
+        assert!(!is_preset_name_char('/'));
+    }
+
+    #[test]
+    fn preset_save_mode_shows_name_buffer() {
+        let mut app = App::new(test_state(Settings::default()), false);
+        app.selected = Field::Preset;
+        app.begin_preset_save();
+        if let PresetUi::Naming { buffer } = &mut app.preset_ui {
+            buffer.push_str("reading");
+        } else {
+            panic!("expected naming mode");
+        }
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let rendered = buffer_text(&terminal);
+        assert!(rendered.contains("save: reading") || rendered.contains("Name: reading"));
+        assert!(rendered.contains("Save preset") || rendered.contains("Enter"));
     }
 
     #[test]

@@ -3,7 +3,7 @@
 use std::{
     process::Command,
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -66,10 +66,19 @@ impl ksni::Tray for WaywarmTray {
     }
 
     fn icon_name(&self) -> String {
+        // Prefer embedded pixmaps; keep a theme fallback for hosts that ignore IconPixmap.
         if self.enabled {
-            "weather-clear-night".into()
+            "night-light-symbolic".into()
         } else {
-            "weather-clear".into()
+            "weather-clear-symbolic".into()
+        }
+    }
+
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        if self.enabled {
+            icons_on().to_vec()
+        } else {
+            icons_off().to_vec()
         }
     }
 
@@ -97,7 +106,7 @@ impl ksni::Tray for WaywarmTray {
             title: "Waywarm".into(),
             description,
             icon_name: self.icon_name(),
-            ..Default::default()
+            icon_pixmap: self.icon_pixmap(),
         }
     }
 
@@ -142,6 +151,45 @@ impl ksni::Tray for WaywarmTray {
     }
 }
 
+fn icons_on() -> &'static [ksni::Icon] {
+    static ICONS: LazyLock<Vec<ksni::Icon>> = LazyLock::new(|| {
+        vec![
+            decode_png_icon(include_bytes!("../assets/waywarm-tray-on-32.png")),
+            decode_png_icon(include_bytes!("../assets/waywarm-tray-on-64.png")),
+        ]
+    });
+    &ICONS
+}
+
+fn icons_off() -> &'static [ksni::Icon] {
+    static ICONS: LazyLock<Vec<ksni::Icon>> = LazyLock::new(|| {
+        vec![
+            decode_png_icon(include_bytes!("../assets/waywarm-tray-off-32.png")),
+            decode_png_icon(include_bytes!("../assets/waywarm-tray-off-64.png")),
+        ]
+    });
+    &ICONS
+}
+
+fn decode_png_icon(bytes: &[u8]) -> ksni::Icon {
+    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    let mut reader = decoder.read_info().expect("tray icon png header");
+    let mut rgba = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut rgba).expect("tray icon png frame");
+    rgba.truncate(info.buffer_size());
+    // PNG is RGBA; StatusNotifierItem wants ARGB32 in network (big-endian) byte order.
+    let mut data = Vec::with_capacity(rgba.len());
+    for pixel in rgba.chunks_exact(4) {
+        let [r, g, b, a] = [pixel[0], pixel[1], pixel[2], pixel[3]];
+        data.extend_from_slice(&u32::from_be_bytes([a, r, g, b]).to_be_bytes());
+    }
+    ksni::Icon {
+        width: info.width as i32,
+        height: info.height as i32,
+        data,
+    }
+}
+
 /// Run the StatusNotifier tray until quit. Requires a running daemon.
 pub fn run() -> Result<()> {
     let state = query_state().context(
@@ -165,4 +213,22 @@ pub fn run() -> Result<()> {
 
     handle.shutdown().wait();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tray_icons_decode() {
+        let on = icons_on();
+        let off = icons_off();
+        assert_eq!(on.len(), 2);
+        assert_eq!(off.len(), 2);
+        assert_eq!(on[0].width, 32);
+        assert_eq!(on[1].width, 64);
+        assert_eq!(on[0].data.len(), 32 * 32 * 4);
+        assert!(!on[0].data.iter().all(|b| *b == 0));
+        assert!(!off[0].data.iter().all(|b| *b == 0));
+    }
 }

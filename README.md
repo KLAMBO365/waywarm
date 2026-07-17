@@ -99,6 +99,9 @@ Use arrow keys or `h`/`j`/`k`/`l` to navigate and adjust values. Press
 `Space` or `Enter` to toggle options, and `q` or `Esc` to quit. Changes are
 applied and saved immediately.
 
+On the Preset row: `←`/`→` choose, `Enter` apply, `s` save (type a name),
+`d` delete (confirm with `Enter`/`y`).
+
 ## CLI
 
 Scriptable commands talk to a running daemon (the optional service, or an open
