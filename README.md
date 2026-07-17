@@ -4,7 +4,8 @@
 
 **A small, friendly blue-light filter for wlroots-based Wayland desktops.**
 
-[![Release](https://img.shields.io/badge/release-0.1.0-7aa2f7?style=flat-square)](https://github.com/KLAMBO365/waywarm/releases)
+[![CI](https://github.com/KLAMBO365/waywarm/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/KLAMBO365/waywarm/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/KLAMBO365/waywarm?style=flat-square&color=7aa2f7)](https://github.com/KLAMBO365/waywarm/releases)
 [![License](https://img.shields.io/badge/license-MIT-9ece6a?style=flat-square)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-e0af68?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 
@@ -24,8 +25,9 @@ Control warmth, brightness, and smooth automatic transitions from a clean termin
 
 ## Install
 
-Requires Linux and a compositor supporting
-`wlr-gamma-control-unstable-v1`.
+Requires Linux **x86_64** and a compositor supporting
+`wlr-gamma-control-unstable-v1`. The curl installer and prebuilt release
+binary are x86_64 only; other architectures need a source build.
 
 Install or update to the latest release with:
 
@@ -80,6 +82,12 @@ GNOME, KDE Plasma, and newer Hyprland versions are not supported.
 > [!IMPORTANT]
 > Gamma control is exclusive. Stop `gammastep`, `wlsunset`, or similar tools
 > before starting Waywarm.
+
+## Configuration
+
+Settings are stored at `~/.config/waywarm/config.toml` (or
+`$XDG_CONFIG_HOME/waywarm/config.toml`). The TUI and CLI update this file
+immediately when you change options.
 
 ## Controls
 

@@ -4,7 +4,13 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
+authors = ["Waywarm contributors"]
 description = "A simple Wayland blue-light filter with a friendly TUI"
+repository = "https://github.com/KLAMBO365/waywarm"
+homepage = "https://github.com/KLAMBO365/waywarm"
+readme = "README.md"
+keywords = ["wayland", "blue-light", "wlroots", "tui", "gamma"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1.0"

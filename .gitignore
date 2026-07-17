@@ -1,2 +1,5 @@
 /target/
-
+AGENTS.md
+.cursor/
+*.swp
+.DS_Store
