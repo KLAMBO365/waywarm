@@ -18,11 +18,15 @@ use ratatui::{
 };
 
 use crate::{
-    config::{Levels, MAX_TRANSITION_MINUTES, MIN_BRIGHTNESS, Schedule, Settings, parse_time},
+    config::{
+        Levels, MAX_TRANSITION_MINUTES, MIN_BRIGHTNESS, Schedule, ScheduleTiming, Settings,
+        parse_time,
+    },
     daemon::TransientBackend,
     gamma::warmth_to_kelvin,
     ipc::{query_state, replace_settings},
     protocol::RuntimeState,
+    schedule::resolve_times,
     service::retire_legacy_service,
 };
 
@@ -46,27 +50,33 @@ enum Field {
     Filter,
     ManualWarmth,
     ManualBrightness,
+    Timing,
     DayWarmth,
     DayBrightness,
     NightWarmth,
     NightBrightness,
     NightStart,
     DayStart,
+    Latitude,
+    Longitude,
     Transition,
 }
 
 impl Field {
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 14] = [
         Self::Mode,
         Self::Filter,
         Self::ManualWarmth,
         Self::ManualBrightness,
+        Self::Timing,
         Self::DayWarmth,
         Self::DayBrightness,
         Self::NightWarmth,
         Self::NightBrightness,
         Self::NightStart,
         Self::DayStart,
+        Self::Latitude,
+        Self::Longitude,
         Self::Transition,
     ];
 
@@ -92,31 +102,13 @@ impl Field {
             (Self::Mode | Self::Filter, _) => self.index() + 1,
             (Self::ManualWarmth | Self::ManualBrightness, false) => self.index() + 2,
             (Self::ManualWarmth | Self::ManualBrightness, true) => self.index() + 3,
-            (
-                Self::DayWarmth
-                | Self::DayBrightness
-                | Self::NightWarmth
-                | Self::NightBrightness
-                | Self::NightStart
-                | Self::DayStart
-                | Self::Transition,
-                false,
-            ) => self.index() + 3,
-            (
-                Self::DayWarmth
-                | Self::DayBrightness
-                | Self::NightWarmth
-                | Self::NightBrightness
-                | Self::NightStart
-                | Self::DayStart
-                | Self::Transition,
-                true,
-            ) => self.index() + 5,
+            (_, false) => self.index() + 3,
+            (_, true) => self.index() + 5,
         }
     }
 
     fn is_toggle(self) -> bool {
-        matches!(self, Self::Mode | Self::Filter)
+        matches!(self, Self::Mode | Self::Filter | Self::Timing)
     }
 }
 
@@ -172,17 +164,19 @@ struct TimelineView {
 }
 
 impl TimelineView {
-    fn from_schedule(schedule: &Schedule, now_minute: u16) -> Result<Self> {
-        let day_start = parse_time(&schedule.day_start)?;
-        let night_start = parse_time(&schedule.night_start)?;
-        let transition_minutes = schedule.transition_minutes;
-        let segments = build_timeline_segments(day_start, night_start, transition_minutes);
+    fn from_schedule(schedule: &Schedule, now: chrono::DateTime<Local>) -> Result<Self> {
+        let times = resolve_times(schedule, now)?;
+        let now_minute = (now.hour() * 60 + now.minute() + if now.second() >= 30 { 1 } else { 0 })
+            as u16
+            % MINUTES_PER_DAY;
+        let segments =
+            build_timeline_segments(times.day_start, times.night_start, times.transition_minutes);
         Ok(Self {
             segments,
-            day_start,
-            night_start,
-            transition_minutes,
-            now_minute: now_minute % MINUTES_PER_DAY,
+            day_start: times.day_start,
+            night_start: times.night_start,
+            transition_minutes: times.transition_minutes,
+            now_minute,
         })
     }
 
@@ -269,11 +263,6 @@ fn add_minutes(start: u16, duration: u16) -> u16 {
 fn format_hhmm(minute: u16) -> String {
     let minute = minute % MINUTES_PER_DAY;
     format!("{:02}:{:02}", minute / 60, minute % 60)
-}
-
-fn current_minute_of_day() -> u16 {
-    let now = Local::now();
-    (now.hour() as u16) * 60 + now.minute() as u16
 }
 
 // ── entry ────────────────────────────────────────────────────────────────────
@@ -426,6 +415,12 @@ impl App {
         match self.selected {
             Field::Filter => self.edit(toggle_filter),
             Field::Mode => self.edit(|settings| settings.automatic = !settings.automatic),
+            Field::Timing => self.edit(|settings| {
+                settings.schedule.timing = match settings.schedule.timing {
+                    ScheduleTiming::Fixed => ScheduleTiming::Location,
+                    ScheduleTiming::Location => ScheduleTiming::Fixed,
+                };
+            }),
             _ => Ok(()),
         }
     }
@@ -434,10 +429,18 @@ impl App {
         let fine = modifiers.contains(KeyModifiers::SHIFT);
         let percent_step = if fine { 1 } else { 5 };
         let time_step = if fine { 1 } else { 15 };
+        let coord_step = if fine { 0.1 } else { 1.0 };
         let selected = self.selected;
         self.edit(move |settings| match selected {
             Field::Filter => set_filter(settings, direction > 0),
             Field::Mode => settings.automatic = direction > 0,
+            Field::Timing => {
+                settings.schedule.timing = if direction > 0 {
+                    ScheduleTiming::Location
+                } else {
+                    ScheduleTiming::Fixed
+                };
+            }
             Field::ManualWarmth => {
                 let manual = manual_levels(settings);
                 adjust_percent(&mut manual.warmth, direction, percent_step, 0);
@@ -487,6 +490,20 @@ impl App {
                 adjust_time(&mut settings.schedule.night_start, direction, time_step)
             }
             Field::DayStart => adjust_time(&mut settings.schedule.day_start, direction, time_step),
+            Field::Latitude => adjust_coordinate(
+                &mut settings.schedule.latitude,
+                direction,
+                coord_step,
+                -90.0,
+                90.0,
+            ),
+            Field::Longitude => adjust_coordinate(
+                &mut settings.schedule.longitude,
+                direction,
+                coord_step,
+                -180.0,
+                180.0,
+            ),
             Field::Transition => {
                 let value = settings.schedule.transition_minutes as i32
                     + direction as i32 * time_step as i32;
@@ -735,7 +752,7 @@ impl App {
 
     fn render_timeline(&self, frame: &mut Frame, area: Rect, compact: bool) {
         let schedule_active = self.state.settings.enabled && self.state.settings.automatic;
-        let now = current_minute_of_day();
+        let now = Local::now();
         let timeline = TimelineView::from_schedule(&self.state.settings.schedule, now).ok();
 
         let title = match (&timeline, schedule_active, compact) {
@@ -1069,13 +1086,19 @@ fn render_settings(frame: &mut Frame, area: Rect, settings: &Settings, selected:
 
     let manual_active = settings.enabled && !settings.automatic;
     let schedule_active = settings.enabled && settings.automatic;
+    let location_active = schedule_active && settings.schedule.timing == ScheduleTiming::Location;
+    let fixed_times_active = schedule_active && settings.schedule.timing == ScheduleTiming::Fixed;
     let mode = if settings.automatic {
         "AUTOMATIC"
     } else {
         "MANUAL"
     };
-    // Compact lists need every row: 3 group headers + 11 fields = 14 lines.
-    let spacious = inner.height >= 16;
+    let timing = match settings.schedule.timing {
+        ScheduleTiming::Fixed => "FIXED",
+        ScheduleTiming::Location => "LOCATION",
+    };
+    // Compact lists need every row: 3 group headers + 14 fields = 17 lines.
+    let spacious = inner.height >= 19;
     let mut items = vec![
         group_item("GENERAL", true),
         value_item("Mode", mode, true, true, false),
@@ -1116,6 +1139,7 @@ fn render_settings(frame: &mut Frame, area: Rect, settings: &Settings, selected:
     }
     items.extend([
         group_item("SCHEDULE", schedule_active),
+        value_item("Timing", timing, schedule_active, true, false),
         value_item(
             "Day warmth",
             format!(
@@ -1155,16 +1179,30 @@ fn render_settings(frame: &mut Frame, area: Rect, settings: &Settings, selected:
         value_item(
             "Night begins",
             settings.schedule.night_start.clone(),
-            schedule_active,
+            fixed_times_active || schedule_active,
             false,
-            true,
+            fixed_times_active,
         ),
         value_item(
             "Day begins",
             settings.schedule.day_start.clone(),
-            schedule_active,
+            fixed_times_active || schedule_active,
             false,
-            true,
+            fixed_times_active,
+        ),
+        value_item(
+            "Latitude",
+            format!("{:.2}°", settings.schedule.latitude),
+            location_active,
+            false,
+            location_active,
+        ),
+        value_item(
+            "Longitude",
+            format!("{:.2}°", settings.schedule.longitude),
+            location_active,
+            false,
+            location_active,
         ),
         value_item(
             "Fade duration",
@@ -1319,6 +1357,10 @@ fn selected_help(selected: Field) -> (&'static str, &'static str) {
             "Manual brightness",
             "Adjust immediate display brightness. Changing this switches from Automatic to Manual mode.",
         ),
+        Field::Timing => (
+            "Timing",
+            "Fixed uses clock times. Location derives day and night starts from civil dawn and dusk.",
+        ),
         Field::DayWarmth => (
             "Day warmth",
             "Choose the warmth held during the day. Zero keeps a neutral white point.",
@@ -1337,11 +1379,19 @@ fn selected_help(selected: Field) -> (&'static str, &'static str) {
         ),
         Field::NightStart => (
             "Night begins",
-            "Set when the evening transition starts in local time.",
+            "Fixed timing start, or fallback when location twilight is unavailable.",
         ),
         Field::DayStart => (
             "Day begins",
-            "Set when the morning transition toward daytime levels starts in local time.",
+            "Fixed timing start, or fallback when location twilight is unavailable.",
+        ),
+        Field::Latitude => (
+            "Latitude",
+            "Observer latitude in degrees for civil dawn and dusk (location timing).",
+        ),
+        Field::Longitude => (
+            "Longitude",
+            "Observer longitude in degrees for civil dawn and dusk (location timing).",
         ),
         Field::Transition => (
             "Fade duration",
@@ -1375,15 +1425,33 @@ fn adjust_time(value: &mut String, direction: i16, step: i16) {
     }
 }
 
+fn adjust_coordinate(value: &mut f64, direction: i16, step: f64, minimum: f64, maximum: f64) {
+    *value = (*value + f64::from(direction) * step).clamp(minimum, maximum);
+}
+
 // ── tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
-    use chrono::Local;
+    use chrono::{Local, TimeZone};
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::*;
     use crate::schedule::current_levels;
+
+    fn noon_local() -> chrono::DateTime<Local> {
+        Local
+            .with_ymd_and_hms(2024, 6, 15, 12, 0, 0)
+            .single()
+            .unwrap()
+    }
+
+    fn midnight_local() -> chrono::DateTime<Local> {
+        Local
+            .with_ymd_and_hms(2024, 6, 15, 0, 0, 0)
+            .single()
+            .unwrap()
+    }
 
     #[test]
     fn values_clamp_and_times_wrap() {
@@ -1445,7 +1513,7 @@ mod tests {
     #[test]
     fn timeline_segments_match_default_schedule() {
         let schedule = Schedule::default();
-        let view = TimelineView::from_schedule(&schedule, 12 * 60).unwrap();
+        let view = TimelineView::from_schedule(&schedule, noon_local()).unwrap();
 
         // Midday is day.
         assert_eq!(view.phase_at(12 * 60), TimelinePhase::Day);
@@ -1467,7 +1535,7 @@ mod tests {
             transition_minutes: 0,
             ..Schedule::default()
         };
-        let view = TimelineView::from_schedule(&schedule, 0).unwrap();
+        let view = TimelineView::from_schedule(&schedule, midnight_local()).unwrap();
         assert_eq!(view.phase_at(21 * 60), TimelinePhase::Night);
         assert_eq!(view.phase_at(7 * 60), TimelinePhase::Day);
         assert_eq!(view.phase_at(6 * 60 + 59), TimelinePhase::Night);
@@ -1489,7 +1557,7 @@ mod tests {
     #[test]
     fn timeline_bar_includes_now_marker() {
         let schedule = Schedule::default();
-        let view = TimelineView::from_schedule(&schedule, 12 * 60).unwrap();
+        let view = TimelineView::from_schedule(&schedule, noon_local()).unwrap();
         let line = render_timeline_bar(48, &view, true);
         let text: String = line
             .spans
@@ -1519,7 +1587,7 @@ mod tests {
         assert!(rendered.contains("MANUAL OVERRIDE"));
         assert!(rendered.contains("Day warmth"));
         assert!(rendered.contains("Night warmth"));
-        assert!(rendered.contains("Fade duration"));
+        assert!(rendered.contains("Timing"));
         assert!(rendered.contains("HELP"));
         assert!(rendered.contains("CONTROLS"));
         assert!(rendered.contains("TODAY"));

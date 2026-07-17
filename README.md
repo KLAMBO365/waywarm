@@ -19,6 +19,7 @@ Control warmth, brightness, and smooth automatic transitions from a clean termin
 
 - Live warmth and brightness controls
 - Automatic schedules with separate day and night targets
+- Optional location timing from civil dawn and dusk
 - Smooth transitions between day and night
 - Standalone mode or an optional systemd user service
 - Immediate, persistent settings
@@ -110,11 +111,14 @@ waywarm set --warmth 40 --brightness 90
 waywarm set --mode automatic
 waywarm set --day-warmth 10 --night-warmth 55
 waywarm set --night-start 21:30 --transition 45
+waywarm set --timing location --latitude 48.8566 --longitude 2.3522
 ```
 
 `set` updates and saves configuration the same way as the TUI. Manual
 `--warmth` / `--brightness` switch into enabled manual mode unless you also
-pass `--mode`. Use `--json` on `status`, `set`, `enable`, `disable`, or
+pass `--mode`. Use `--timing location` with `--latitude` / `--longitude` to
+follow civil dawn and dusk (fixed clock times remain the fallback). Use
+`--json` on `status`, `set`, `enable`, `disable`, or
 `toggle` for machine-readable output (`RuntimeState` fields may grow over
 time).
 

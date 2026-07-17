@@ -41,7 +41,9 @@ Set options:
   --day-warmth <0-100>  --day-brightness <10-100>
   --night-warmth <0-100>  --night-brightness <10-100>
   --night-start <HH:MM>  --day-start <HH:MM>
-  --transition <0-240>  --json
+  --transition <0-240>
+  --timing fixed|location  --latitude <deg>  --longitude <deg>
+  --json
 
 CLI commands talk to a running daemon. Install the service with
 `waywarm daemon`, or keep the settings UI open."

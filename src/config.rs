@@ -37,6 +37,17 @@ impl Default for Levels {
     }
 }
 
+/// How automatic day/night transition times are chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleTiming {
+    /// Use fixed `day_start` / `night_start` clock times.
+    #[default]
+    Fixed,
+    /// Derive times from civil dawn/dusk at `latitude` / `longitude`.
+    Location,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Schedule {
@@ -46,6 +57,12 @@ pub struct Schedule {
     /// Daytime target while automatic mode is active (defaults to neutral).
     pub day: Levels,
     pub night: Levels,
+    /// Fixed clock times, or civil twilight from coordinates.
+    pub timing: ScheduleTiming,
+    /// Degrees north; used when `timing` is [`ScheduleTiming::Location`].
+    pub latitude: f64,
+    /// Degrees east; used when `timing` is [`ScheduleTiming::Location`].
+    pub longitude: f64,
 }
 
 impl Default for Schedule {
@@ -59,27 +76,48 @@ impl Default for Schedule {
                 warmth: 50,
                 brightness: 90,
             },
+            timing: ScheduleTiming::Fixed,
+            latitude: 0.0,
+            longitude: 0.0,
         }
     }
 }
 
 impl Schedule {
     pub fn validate(&self) -> Result<()> {
+        if self.transition_minutes > MAX_TRANSITION_MINUTES {
+            bail!("transition must be between 0 and 240 minutes");
+        }
+        self.day.validate()?;
+        self.night.validate()?;
+
+        match self.timing {
+            ScheduleTiming::Fixed => self.validate_fixed_times(),
+            ScheduleTiming::Location => {
+                if !(-90.0..=90.0).contains(&self.latitude) {
+                    bail!("latitude must be between -90 and 90 degrees");
+                }
+                if !(-180.0..=180.0).contains(&self.longitude) {
+                    bail!("longitude must be between -180 and 180 degrees");
+                }
+                // Keep fallback clock times valid for polar days / failed sun calc.
+                self.validate_fixed_times()
+            }
+        }
+    }
+
+    fn validate_fixed_times(&self) -> Result<()> {
         let night = parse_time(&self.night_start)?;
         let day = parse_time(&self.day_start)?;
         if night == day {
             bail!("day and night start times must differ");
-        }
-        if self.transition_minutes > MAX_TRANSITION_MINUTES {
-            bail!("transition must be between 0 and 240 minutes");
         }
         let gap = night.abs_diff(day);
         let shortest_gap = gap.min(MINUTES_PER_DAY - gap);
         if self.transition_minutes > shortest_gap {
             bail!("transition is longer than the gap between day and night start times");
         }
-        self.day.validate()?;
-        self.night.validate()
+        Ok(())
     }
 }
 
@@ -261,5 +299,23 @@ brightness = 90
         settings.validate().unwrap();
         assert_eq!(settings.schedule.day, Levels::NEUTRAL);
         assert_eq!(settings.schedule.night.warmth, 50);
+        assert_eq!(settings.schedule.timing, ScheduleTiming::Fixed);
+    }
+
+    #[test]
+    fn accepts_location_timing() {
+        let mut settings = Settings::default();
+        settings.schedule.timing = ScheduleTiming::Location;
+        settings.schedule.latitude = 48.8566;
+        settings.schedule.longitude = 2.3522;
+        settings.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_invalid_coordinates() {
+        let mut settings = Settings::default();
+        settings.schedule.timing = ScheduleTiming::Location;
+        settings.schedule.latitude = 100.0;
+        assert!(settings.validate().is_err());
     }
 }

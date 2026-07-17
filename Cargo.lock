@@ -1390,6 +1390,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sunrise"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15eecb5ec59a060dd9fe8f88c48b701abecd6be9d9c28d55081b80bdda73981c"
+dependencies = [
+ "chrono",
+]
+
+[[package]]
 name = "syn"
 version = "1.0.109"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1816,6 +1825,7 @@ dependencies = [
  "serde",
  "serde_json",
  "signal-hook",
+ "sunrise",
  "tempfile",
  "thiserror 2.0.18",
  "toml",

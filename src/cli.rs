@@ -1,7 +1,9 @@
 use anyhow::{Result, bail};
 
 use crate::{
-    config::{Levels, MAX_TRANSITION_MINUTES, MIN_BRIGHTNESS, Settings, parse_time},
+    config::{
+        Levels, MAX_TRANSITION_MINUTES, MIN_BRIGHTNESS, ScheduleTiming, Settings, parse_time,
+    },
     ipc::{query_state, replace_settings},
     protocol::RuntimeState,
 };
@@ -126,7 +128,7 @@ fn parse_flag_only(args: &[String], command: &str) -> Result<FlagOnly> {
     Ok(FlagOnly::Json(json))
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 struct SetOptions {
     enabled: Option<bool>,
     automatic: Option<bool>,
@@ -139,6 +141,9 @@ struct SetOptions {
     night_start: Option<String>,
     day_start: Option<String>,
     transition: Option<u16>,
+    timing: Option<ScheduleTiming>,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
 }
 
 impl SetOptions {
@@ -207,6 +212,18 @@ fn parse_set_args(args: &[String]) -> Result<SetParse> {
                 let value = next_value(args, &mut index, "--transition")?;
                 options.transition = Some(parse_transition(&value)?);
             }
+            "--timing" => {
+                let value = next_value(args, &mut index, "--timing")?;
+                options.timing = Some(parse_timing(&value)?);
+            }
+            "--latitude" | "--lat" => {
+                let value = next_value(args, &mut index, "--latitude")?;
+                options.latitude = Some(parse_coordinate(&value, "latitude", -90.0, 90.0)?);
+            }
+            "--longitude" | "--lon" => {
+                let value = next_value(args, &mut index, "--longitude")?;
+                options.longitude = Some(parse_coordinate(&value, "longitude", -180.0, 180.0)?);
+            }
             other if other.starts_with('-') => {
                 bail!("unknown option {other:?}; use `waywarm set --help`")
             }
@@ -252,6 +269,24 @@ fn parse_transition(value: &str) -> Result<u16> {
     Ok(parsed)
 }
 
+fn parse_timing(value: &str) -> Result<ScheduleTiming> {
+    match value {
+        "fixed" | "clock" => Ok(ScheduleTiming::Fixed),
+        "location" | "sun" => Ok(ScheduleTiming::Location),
+        _ => bail!("invalid timing {value:?}; expected fixed or location"),
+    }
+}
+
+fn parse_coordinate(value: &str, name: &str, min: f64, max: f64) -> Result<f64> {
+    let parsed: f64 = value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid {name} {value:?}; expected a number"))?;
+    if !(min..=max).contains(&parsed) {
+        bail!("{name} must be between {min} and {max}");
+    }
+    Ok(parsed)
+}
+
 fn apply_set_options(settings: &mut Settings, options: &SetOptions) -> Result<()> {
     if let Some(enabled) = options.enabled {
         settings.enabled = enabled;
@@ -290,6 +325,15 @@ fn apply_set_options(settings: &mut Settings, options: &SetOptions) -> Result<()
     if let Some(transition) = options.transition {
         settings.schedule.transition_minutes = transition;
     }
+    if let Some(timing) = options.timing {
+        settings.schedule.timing = timing;
+    }
+    if let Some(latitude) = options.latitude {
+        settings.schedule.latitude = latitude;
+    }
+    if let Some(longitude) = options.longitude {
+        settings.schedule.longitude = longitude;
+    }
 
     // Mode flags after warmth/brightness still win so scripts can set manual levels then switch mode.
     if let Some(automatic) = options.automatic {
@@ -302,7 +346,12 @@ fn apply_set_options(settings: &mut Settings, options: &SetOptions) -> Result<()
     settings.manual.validate()?;
     settings.schedule.day.validate()?;
     settings.schedule.night.validate()?;
-    if options.night_start.is_some() || options.day_start.is_some() || options.transition.is_some()
+    if options.night_start.is_some()
+        || options.day_start.is_some()
+        || options.transition.is_some()
+        || options.timing.is_some()
+        || options.latitude.is_some()
+        || options.longitude.is_some()
     {
         settings.schedule.validate()?;
     }
@@ -317,6 +366,19 @@ fn format_status_human(state: &RuntimeState) -> String {
     } else {
         "manual"
     };
+    let timing = match settings.schedule.timing {
+        ScheduleTiming::Fixed => format!(
+            "fixed · night {} · day {}",
+            settings.schedule.night_start, settings.schedule.day_start
+        ),
+        ScheduleTiming::Location => format!(
+            "location · {:.4}°, {:.4}° (fallback night {} · day {})",
+            settings.schedule.latitude,
+            settings.schedule.longitude,
+            settings.schedule.night_start,
+            settings.schedule.day_start
+        ),
+    };
     let outputs = if state.outputs.is_empty() {
         "(none)".into()
     } else {
@@ -329,15 +391,13 @@ fn format_status_human(state: &RuntimeState) -> String {
          Manual:     {}\n\
          Day:        {}\n\
          Night:      {}\n\
-         Schedule:   night {} · day {} · fade {}m\n\
+         Schedule:   {timing} · fade {}m\n\
          Backend:    {}\n\
          Outputs:    {outputs}\n",
         format_levels_line(state.active_warmth, state.active_brightness),
         format_levels(settings.manual),
         format_levels(settings.schedule.day),
         format_levels(settings.schedule.night),
-        settings.schedule.night_start,
-        settings.schedule.day_start,
         settings.schedule.transition_minutes,
         state.backend,
     )
@@ -367,9 +427,12 @@ Options:\n\
   --day-brightness <10-100>    Daytime schedule brightness\n\
   --night-warmth <0-100>       Night schedule warmth\n\
   --night-brightness <10-100>  Night schedule brightness\n\
-  --night-start <HH:MM>        Evening transition start\n\
-  --day-start <HH:MM>          Morning transition start\n\
+  --night-start <HH:MM>        Evening transition start (fixed / fallback)\n\
+  --day-start <HH:MM>          Morning transition start (fixed / fallback)\n\
   --transition <0-240>         Fade duration in minutes\n\
+  --timing fixed|location      Clock times or civil dawn/dusk (aliases: clock, sun)\n\
+  --latitude <deg>             Latitude for location timing (alias: --lat)\n\
+  --longitude <deg>            Longitude for location timing (alias: --lon)\n\
   --json                       Print resulting state as JSON\n\
 \n\
 Requires a running Waywarm daemon (service or open settings UI)."
@@ -381,7 +444,7 @@ Requires a running Waywarm daemon (service or open settings UI)."
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Schedule;
+    use crate::config::{Schedule, ScheduleTiming};
 
     #[test]
     fn parse_set_args_accepts_common_flags() {
@@ -478,6 +541,9 @@ mod tests {
             night_start: Some("22:00".into()),
             day_start: Some("06:30".into()),
             transition: Some(45),
+            timing: Some(ScheduleTiming::Location),
+            latitude: Some(48.8566),
+            longitude: Some(2.3522),
             ..SetOptions::default()
         };
         apply_set_options(&mut settings, &options).unwrap();
@@ -495,6 +561,9 @@ mod tests {
                     warmth: 70,
                     brightness: 85,
                 },
+                timing: ScheduleTiming::Location,
+                latitude: 48.8566,
+                longitude: 2.3522,
             }
         );
     }
