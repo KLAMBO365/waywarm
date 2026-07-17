@@ -21,6 +21,7 @@ Control warmth, brightness, and smooth automatic transitions from a clean termin
 - Automatic schedules with separate day and night targets
 - Optional location timing from civil dawn and dusk
 - Named presets for quick profile switching
+- Optional StatusNotifier tray for toggle without the TUI
 - Smooth transitions between day and night
 - Standalone mode or an optional systemd user service
 - Immediate, persistent settings
@@ -127,6 +128,18 @@ store mode, levels, and schedule (not the filter on/off toggle). Use
 `--json` on `status`, `set`, `enable`, `disable`, or
 `toggle` for machine-readable output (`RuntimeState` fields may grow over
 time).
+
+## Tray
+
+With a running daemon and a StatusNotifier host (for example Waybar, Swaybar,
+or a desktop panel), start a tray icon:
+
+```console
+waywarm tray
+```
+
+Left-click toggles the filter. The menu can toggle, open the settings UI, or
+quit the tray process (the display daemon keeps running).
 
 ## License
 

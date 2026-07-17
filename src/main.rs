@@ -9,6 +9,7 @@ fn main() -> Result<()> {
             waywarm::service::retire_legacy_service()?;
             waywarm::daemon::run()
         }
+        Some("tray") if arguments.len() == 0 => waywarm::tray::run(),
         Some(command @ ("status" | "set" | "enable" | "disable" | "toggle" | "preset")) => {
             waywarm::cli::run(command, arguments)
         }
@@ -28,6 +29,7 @@ Waywarm — a wlroots blue-light filter
 Usage:
   waywarm                 Open the settings interface
   waywarm daemon          Manage the optional background service
+  waywarm tray            StatusNotifier tray (toggle / open settings)
   waywarm status [--json] Show filter state (requires a running daemon)
   waywarm enable|disable|toggle [--json]
   waywarm preset list|save|apply|delete

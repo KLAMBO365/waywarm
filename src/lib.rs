@@ -8,4 +8,5 @@ pub mod protocol;
 pub mod schedule;
 pub mod service;
 pub mod service_tui;
+pub mod tray;
 pub mod tui;
