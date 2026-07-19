@@ -1,9 +1,10 @@
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 fn main() -> Result<()> {
     let mut arguments = std::env::args().skip(1);
     match arguments.next().as_deref() {
-        None => waywarm::tui::run(),
+        None => waywarm::gui::run(),
+        Some("tui") if arguments.len() == 0 => waywarm::tui::run(),
         Some("daemon") if arguments.len() == 0 => waywarm::service_tui::run(),
         Some("--daemon") if arguments.len() == 0 => {
             waywarm::service::retire_legacy_service()?;
@@ -17,7 +18,7 @@ fn main() -> Result<()> {
             print_help();
             Ok(())
         }
-        Some(argument) => bail!("unknown argument {argument:?}; use --help"),
+        Some(argument) => anyhow::bail!("unknown argument {argument:?}; use --help"),
     }
 }
 
@@ -27,7 +28,8 @@ fn print_help() {
 Waywarm — a wlroots blue-light filter
 
 Usage:
-  waywarm                 Open the settings interface
+  waywarm                 Open the settings interface (GTK)
+  waywarm tui             Open the terminal settings interface
   waywarm daemon          Manage the optional background service
   waywarm tray            StatusNotifier tray (toggle / open settings)
   waywarm status [--json] Show filter state (requires a running daemon)

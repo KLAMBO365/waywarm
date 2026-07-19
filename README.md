@@ -9,7 +9,8 @@
 [![License](https://img.shields.io/badge/license-MIT-9ece6a?style=flat-square)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-e0af68?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 
-Control warmth, brightness, and smooth automatic transitions from a clean terminal UI.
+Control warmth, brightness, and smooth automatic transitions from a GTK settings
+window or an optional terminal UI.
 
 <img src="assets/waywarm-tui.png" alt="Waywarm settings interface" width="820">
 
@@ -21,7 +22,7 @@ Control warmth, brightness, and smooth automatic transitions from a clean termin
 - Automatic schedules with separate day and night targets
 - Optional location timing from civil dawn and dusk
 - Named presets for quick profile switching
-- Optional StatusNotifier tray for toggle without the TUI
+- Optional StatusNotifier tray for toggle without the settings UI
 - Smooth transitions between day and night
 - Standalone mode or an optional systemd user service
 - Immediate, persistent settings
@@ -69,6 +70,10 @@ install -Dm755 waywarm-*/waywarm ~/.local/bin/waywarm
 <details>
 <summary>Build from source (Rust 1.88+)</summary>
 
+Needs GTK 4 and libadwaita development packages (for example
+`libgtk-4-dev` and `libadwaita-1-dev` on Debian/Ubuntu, or `gtk4-devel` and
+`libadwaita-devel` on Fedora).
+
 ```console
 git clone https://github.com/KLAMBO365/waywarm.git
 cd waywarm
@@ -90,17 +95,25 @@ GNOME, KDE Plasma, and newer Hyprland versions are not supported.
 ## Configuration
 
 Settings are stored at `~/.config/waywarm/config.toml` (or
-`$XDG_CONFIG_HOME/waywarm/config.toml`). The TUI and CLI update this file
-immediately when you change options.
+`$XDG_CONFIG_HOME/waywarm/config.toml`). The settings UI and CLI update this
+file immediately when you change options.
 
-## Controls
+## Settings UI
 
-Use arrow keys or `h`/`j`/`k`/`l` to navigate and adjust values. Press
-`Space` or `Enter` to toggle options, and `q` or `Esc` to quit. Changes are
-applied and saved immediately.
+`waywarm` opens the GTK dashboard. Use the switches, sliders, and preset
+controls to change filter mode, levels, and schedule. Changes are applied and
+saved immediately.
 
-On the Preset row: `←`/`→` choose, `Enter` apply, `s` save (type a name),
-`d` delete (confirm with `Enter`/`y`).
+For the terminal interface:
+
+```console
+waywarm tui
+```
+
+In the TUI, use arrow keys or `h`/`j`/`k`/`l` to navigate and adjust values.
+Press `Space` or `Enter` to toggle options, and `q` or `Esc` to quit. On the
+Preset row: `←`/`→` choose, `Enter` apply, `s` save (type a name), `d` delete
+(confirm with `Enter`/`y`).
 
 ## CLI
 
@@ -123,7 +136,7 @@ waywarm preset apply reading
 waywarm preset list
 ```
 
-`set` updates and saves configuration the same way as the TUI. Manual
+`set` updates and saves configuration the same way as the settings UI. Manual
 `--warmth` / `--brightness` switch into enabled manual mode unless you also
 pass `--mode`. Use `--timing location` with `--latitude` / `--longitude` to
 follow civil dawn and dusk (fixed clock times remain the fallback). Presets

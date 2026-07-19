@@ -13,7 +13,7 @@ env:
 jobs:
   release:
     name: x86_64 Linux
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
 
     steps:
@@ -31,6 +31,11 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
           rustup default stable
+
+      - name: Install GTK development packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
 
       - name: Cache Cargo data
         uses: actions/cache@v5

@@ -5,16 +5,18 @@ edition = "2024"
 rust-version = "1.88"
 license = "MIT"
 authors = ["Waywarm contributors"]
-description = "A simple Wayland blue-light filter with a friendly TUI"
+description = "A simple Wayland blue-light filter with GTK and TUI frontends"
 repository = "https://github.com/KLAMBO365/waywarm"
 homepage = "https://github.com/KLAMBO365/waywarm"
 readme = "README.md"
-keywords = ["wayland", "blue-light", "wlroots", "tui", "gamma"]
+keywords = ["wayland", "blue-light", "wlroots", "gtk", "gamma"]
 categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+gtk = { package = "gtk4", version = "0.9", features = ["v4_12"] }
+adw = { package = "libadwaita", version = "0.7", features = ["v1_5"] }
 ksni = { version = "0.3", features = ["blocking"] }
 libc = "0.2"
 png = "0.17"
