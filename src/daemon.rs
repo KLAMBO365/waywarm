@@ -60,8 +60,15 @@ struct DaemonState {
     outputs: Vec<Output>,
     settings: Settings,
     store: ConfigStore,
+    /// When false, IPC setting updates stay in memory and are not written to disk.
+    persist: bool,
     active: Levels,
     conflict: Option<String>,
+}
+
+struct SessionOptions {
+    settings: Settings,
+    persist: bool,
 }
 
 impl DaemonState {
@@ -182,7 +189,29 @@ pub fn run() -> Result<()> {
     let terminating = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(SIGTERM, terminating.clone())?;
     signal_hook::flag::register(SIGINT, terminating.clone())?;
-    run_until(terminating)
+    let store = ConfigStore::discover()?;
+    let settings = store.load_or_create()?;
+    run_until(
+        terminating,
+        SessionOptions {
+            settings,
+            persist: true,
+        },
+    )
+}
+
+/// Run a foreground gamma session with the given settings without writing config.
+pub fn run_session(settings: Settings) -> Result<()> {
+    let terminating = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(SIGTERM, terminating.clone())?;
+    signal_hook::flag::register(SIGINT, terminating.clone())?;
+    run_until(
+        terminating,
+        SessionOptions {
+            settings,
+            persist: false,
+        },
+    )
 }
 
 pub struct TransientBackend {
@@ -194,7 +223,17 @@ impl TransientBackend {
     pub fn start() -> Self {
         let terminating = Arc::new(AtomicBool::new(false));
         let thread_terminating = terminating.clone();
-        let thread = thread::spawn(move || run_until(thread_terminating));
+        let thread = thread::spawn(move || {
+            let store = ConfigStore::discover()?;
+            let settings = store.load_or_create()?;
+            run_until(
+                thread_terminating,
+                SessionOptions {
+                    settings,
+                    persist: true,
+                },
+            )
+        });
         Self {
             terminating,
             thread: Some(thread),
@@ -227,10 +266,9 @@ impl Drop for TransientBackend {
     }
 }
 
-fn run_until(terminating: Arc<AtomicBool>) -> Result<()> {
+fn run_until(terminating: Arc<AtomicBool>, options: SessionOptions) -> Result<()> {
     let store = ConfigStore::discover()?;
-    let settings = store.load_or_create()?;
-    let active = current_levels(&settings, Local::now())?;
+    let active = current_levels(&options.settings, Local::now())?;
     let (listener, _socket_guard) = bind_listener()?;
 
     let connection = Connection::connect_to_env().context(
@@ -245,8 +283,9 @@ fn run_until(terminating: Arc<AtomicBool>) -> Result<()> {
     let mut state = DaemonState {
         manager,
         outputs: Vec::new(),
-        settings,
+        settings: options.settings,
         store,
+        persist: options.persist,
         active,
         conflict: None,
     };
@@ -396,7 +435,9 @@ fn error_response(message: impl Into<String>) -> Response {
 
 fn update_settings(state: &mut DaemonState, settings: Settings) -> Result<()> {
     settings.validate()?;
-    state.store.save(&settings)?;
+    if state.persist {
+        state.store.save(&settings)?;
+    }
     state.settings = settings;
     state.active = current_levels(&state.settings, Local::now())?;
     state.apply_all()

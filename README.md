@@ -104,8 +104,8 @@ On the Preset row: `←`/`→` choose, `Enter` apply, `s` save (type a name),
 
 ## CLI
 
-Scriptable commands talk to a running daemon (the optional service, or an open
-settings UI). They fail clearly if nothing is listening.
+Most scriptable commands talk to a running daemon (the optional service, or an
+open settings UI). They fail clearly if nothing is listening.
 
 ```console
 waywarm status
@@ -121,7 +121,18 @@ waywarm set --timing location --latitude 48.8566 --longitude 2.3522
 waywarm preset save reading
 waywarm preset apply reading
 waywarm preset list
+waywarm export preset reading
 ```
+
+`export preset` prints a daemon-free `waywarm apply …` line that reproduces
+the named preset. Paste it into a compositor config, for example:
+
+```
+exec waywarm apply --mode manual --warmth 50 --brightness 90
+```
+
+`apply` holds gamma control in the foreground until stopped and does not
+rewrite `config.toml`. It conflicts with an already-running Waywarm daemon.
 
 `set` updates and saves configuration the same way as the TUI. Manual
 `--warmth` / `--brightness` switch into enabled manual mode unless you also

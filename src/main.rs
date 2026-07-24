@@ -10,9 +10,10 @@ fn main() -> Result<()> {
             waywarm::daemon::run()
         }
         Some("tray") if arguments.len() == 0 => waywarm::tray::run(),
-        Some(command @ ("status" | "set" | "enable" | "disable" | "toggle" | "preset")) => {
-            waywarm::cli::run(command, arguments)
-        }
+        Some(
+            command @ ("status" | "set" | "enable" | "disable" | "toggle" | "preset" | "export"
+            | "apply"),
+        ) => waywarm::cli::run(command, arguments),
         Some("--help" | "-h" | "help") if arguments.len() == 0 => {
             print_help();
             Ok(())
@@ -33,12 +34,15 @@ Usage:
   waywarm status [--json] Show filter state (requires a running daemon)
   waywarm enable|disable|toggle [--json]
   waywarm preset list|save|apply|delete
+  waywarm export preset <name>
+                          Print a daemon-free apply command for a preset
+  waywarm apply [options] Foreground gamma session (no pre-running daemon)
   waywarm set [options]   Change settings from scripts
   waywarm --daemon        Internal service process
   waywarm --help          Show this help
 
-Set options:
-  --on | --off
+Set / apply options:
+  --on | --off            (set only)
   --mode automatic|manual
   --warmth <0-100>  --brightness <10-100>
   --day-warmth <0-100>  --day-brightness <10-100>
@@ -46,9 +50,11 @@ Set options:
   --night-start <HH:MM>  --day-start <HH:MM>
   --transition <0-240>
   --timing fixed|location  --latitude <deg>  --longitude <deg>
-  --json
+  --json                  (set / status / toggle / …)
 
-CLI commands talk to a running daemon. Install the service with
-`waywarm daemon`, or keep the settings UI open."
+Most CLI commands talk to a running daemon. `export` reads config.toml
+directly. `apply` holds gamma itself until stopped — useful in sway/i3
+`exec` lines. Install the service with `waywarm daemon`, or keep the
+settings UI open for daemon-backed commands."
     );
 }

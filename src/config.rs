@@ -264,6 +264,11 @@ impl ConfigStore {
             self.save(&settings)?;
             return Ok(settings);
         }
+        self.load()
+    }
+
+    /// Load settings from disk. Errors if the config file is missing.
+    pub fn load(&self) -> Result<Settings> {
         let source = fs::read_to_string(&self.path)
             .with_context(|| format!("failed to read {}", self.path.display()))?;
         let settings: Settings = toml::from_str(&source)

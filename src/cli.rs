@@ -1,9 +1,11 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 use crate::{
     config::{
-        Levels, MAX_TRANSITION_MINUTES, MIN_BRIGHTNESS, ScheduleTiming, Settings, parse_time,
+        ConfigStore, Levels, MAX_TRANSITION_MINUTES, MIN_BRIGHTNESS, Preset, ScheduleTiming,
+        Settings, parse_time,
     },
+    daemon,
     ipc::{query_state, replace_settings},
     protocol::RuntimeState,
 };
@@ -18,6 +20,8 @@ pub fn run(command: &str, args: impl IntoIterator<Item = String>) -> Result<()> 
         "disable" => set_enabled(false, &args),
         "toggle" => toggle(&args),
         "preset" => preset(&args),
+        "export" => export(&args),
+        "apply" => apply(&args),
         _ => bail!("unknown CLI command {command:?}; use --help"),
     }
 }
@@ -41,7 +45,7 @@ fn status(args: &[String]) -> Result<()> {
 }
 
 fn set(args: &[String]) -> Result<()> {
-    let (options, json) = match parse_set_args(args)? {
+    let (options, json) = match parse_set_args(args, "set")? {
         SetParse::Help(help) => {
             println!("{help}");
             return Ok(());
@@ -187,6 +191,130 @@ fn preset_delete(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn export(args: &[String]) -> Result<()> {
+    if args.is_empty() || matches!(args[0].as_str(), "--help" | "-h") {
+        println!("{}", command_help("export"));
+        return Ok(());
+    }
+    let kind = args[0].as_str();
+    let rest = &args[1..];
+    match kind {
+        "preset" => export_preset(rest),
+        other => bail!("unknown export kind {other:?}; use `waywarm export --help`"),
+    }
+}
+
+fn export_preset(args: &[String]) -> Result<()> {
+    let mut name = None;
+    for arg in args {
+        match arg.as_str() {
+            "--help" | "-h" => {
+                println!("{}", command_help("export"));
+                return Ok(());
+            }
+            other if other.starts_with('-') => {
+                bail!("unexpected argument {other:?}; use `waywarm export --help`")
+            }
+            other if name.is_none() => name = Some(other.to_owned()),
+            other => bail!("unexpected argument {other:?}; use `waywarm export --help`"),
+        }
+    }
+    let name =
+        name.ok_or_else(|| anyhow::anyhow!("missing preset name; see `waywarm export --help`"))?;
+    let store = ConfigStore::discover()?;
+    let settings = store.load().with_context(|| {
+        format!(
+            "no Waywarm config at {}; save a preset from the settings UI first",
+            store.path().display()
+        )
+    })?;
+    let preset = settings
+        .presets
+        .get(&name)
+        .with_context(|| format!("unknown preset {name:?}"))?;
+    println!("{}", format_apply_command(preset));
+    Ok(())
+}
+
+fn apply(args: &[String]) -> Result<()> {
+    let options = match parse_set_args(args, "apply")? {
+        SetParse::Help(help) => {
+            println!("{help}");
+            return Ok(());
+        }
+        SetParse::Options { options, json } => {
+            if json {
+                bail!(
+                    "`--json` is not supported for `apply`; omit it or use `set` against a daemon"
+                );
+            }
+            options
+        }
+    };
+    if options.is_empty() {
+        bail!("nothing to apply; pass at least one option (see `waywarm apply --help`)");
+    }
+    if options.enabled == Some(false) {
+        bail!("`apply` keeps the filter on; omit `--off`");
+    }
+    let mut settings = Settings::default();
+    apply_set_options(&mut settings, &options)?;
+    settings.enabled = true;
+    settings.validate()?;
+    daemon::run_session(settings)
+}
+
+/// Format a preset as a daemon-free `waywarm apply …` command line.
+fn format_apply_command(preset: &Preset) -> String {
+    let mut parts = vec!["waywarm".into(), "apply".into()];
+    if preset.automatic {
+        parts.push("--mode".into());
+        parts.push("automatic".into());
+        parts.push("--day-warmth".into());
+        parts.push(preset.schedule.day.warmth.to_string());
+        parts.push("--day-brightness".into());
+        parts.push(preset.schedule.day.brightness.to_string());
+        parts.push("--night-warmth".into());
+        parts.push(preset.schedule.night.warmth.to_string());
+        parts.push("--night-brightness".into());
+        parts.push(preset.schedule.night.brightness.to_string());
+        parts.push("--night-start".into());
+        parts.push(preset.schedule.night_start.clone());
+        parts.push("--day-start".into());
+        parts.push(preset.schedule.day_start.clone());
+        parts.push("--transition".into());
+        parts.push(preset.schedule.transition_minutes.to_string());
+        parts.push("--timing".into());
+        match preset.schedule.timing {
+            ScheduleTiming::Fixed => parts.push("fixed".into()),
+            ScheduleTiming::Location => {
+                parts.push("location".into());
+                parts.push("--latitude".into());
+                parts.push(format_coordinate(preset.schedule.latitude));
+                parts.push("--longitude".into());
+                parts.push(format_coordinate(preset.schedule.longitude));
+            }
+        }
+    } else {
+        parts.push("--mode".into());
+        parts.push("manual".into());
+        parts.push("--warmth".into());
+        parts.push(preset.manual.warmth.to_string());
+        parts.push("--brightness".into());
+        parts.push(preset.manual.brightness.to_string());
+    }
+    parts.join(" ")
+}
+
+fn format_coordinate(value: f64) -> String {
+    let text = format!("{value}");
+    if text.contains('.') || text.contains('e') || text.contains('E') {
+        text
+    } else {
+        format!("{value:.1}")
+    }
+}
+
 /// Returns `None` when help was requested.
 fn parse_preset_name_args(args: &[String]) -> Result<Option<(String, bool)>> {
     let mut name = None;
@@ -263,14 +391,14 @@ enum SetParse {
     Options { options: SetOptions, json: bool },
 }
 
-fn parse_set_args(args: &[String]) -> Result<SetParse> {
+fn parse_set_args(args: &[String], command: &str) -> Result<SetParse> {
     let mut options = SetOptions::default();
     let mut json = false;
     let mut index = 0;
     while index < args.len() {
         let arg = args[index].as_str();
         match arg {
-            "--help" | "-h" => return Ok(SetParse::Help(command_help("set"))),
+            "--help" | "-h" => return Ok(SetParse::Help(command_help(command))),
             "--json" => json = true,
             "--on" => options.enabled = Some(true),
             "--off" => options.enabled = Some(false),
@@ -331,9 +459,9 @@ fn parse_set_args(args: &[String]) -> Result<SetParse> {
                 options.longitude = Some(parse_coordinate(&value, "longitude", -180.0, 180.0)?);
             }
             other if other.starts_with('-') => {
-                bail!("unknown option {other:?}; use `waywarm set --help`")
+                bail!("unknown option {other:?}; use `waywarm {command} --help`")
             }
-            other => bail!("unexpected argument {other:?}; use `waywarm set --help`"),
+            other => bail!("unexpected argument {other:?}; use `waywarm {command} --help`"),
         }
         index += 1;
     }
@@ -548,6 +676,33 @@ Actions:\n\
 Presets store automatic/manual mode, levels, and schedule — not the filter\n\
 enable toggle. Requires a running Waywarm daemon."
             .into(),
+        "export" => "Usage: waywarm export preset <name>\n\n\
+Print a daemon-free `waywarm apply …` command that reproduces the named\n\
+preset. Reads ~/.config/waywarm/config.toml (no daemon required). Paste the\n\
+line into a compositor config, for example `exec <printed command>` in sway."
+            .into(),
+        "apply" => "Usage: waywarm apply [options]\n\n\
+Run a foreground gamma session with the given settings. Does not require a\n\
+pre-running daemon and does not rewrite config.toml. Suitable for compositor\n\
+startup (`exec` in sway / i3). Stops on SIGINT/SIGTERM.\n\
+\n\
+Options:\n\
+  --mode automatic|manual      Schedule mode (aliases: auto)\n\
+  --warmth <0-100>             Manual warmth\n\
+  --brightness <10-100>        Manual brightness\n\
+  --day-warmth <0-100>         Daytime schedule warmth\n\
+  --day-brightness <10-100>    Daytime schedule brightness\n\
+  --night-warmth <0-100>       Night schedule warmth\n\
+  --night-brightness <10-100>  Night schedule brightness\n\
+  --night-start <HH:MM>        Evening transition start (fixed / fallback)\n\
+  --day-start <HH:MM>          Morning transition start (fixed / fallback)\n\
+  --transition <0-240>         Fade duration in minutes\n\
+  --timing fixed|location      Clock times or civil dawn/dusk (aliases: clock, sun)\n\
+  --latitude <deg>             Latitude for location timing (alias: --lat)\n\
+  --longitude <deg>            Longitude for location timing (alias: --lon)\n\
+\n\
+The filter is always enabled. Conflicts with an already-running Waywarm daemon."
+            .into(),
         "set" => "Usage: waywarm set [options]\n\n\
 Options:\n\
   --on | --off                 Enable or disable the filter\n\
@@ -590,7 +745,7 @@ mod tests {
             "22:30".into(),
             "--json".into(),
         ];
-        let SetParse::Options { options, json } = parse_set_args(&args).unwrap() else {
+        let SetParse::Options { options, json } = parse_set_args(&args, "set").unwrap() else {
             panic!("expected options");
         };
         assert!(json);
@@ -602,14 +757,14 @@ mod tests {
 
     #[test]
     fn parse_set_args_rejects_bad_values() {
-        assert!(parse_set_args(&["--warmth".into(), "200".into()]).is_err());
-        assert!(parse_set_args(&["--brightness".into(), "5".into()]).is_err());
-        assert!(parse_set_args(&["--mode".into(), "schedule".into()]).is_err());
-        assert!(parse_set_args(&["--night-start".into(), "9:00".into()]).is_err());
-        assert!(parse_set_args(&["--transition".into(), "999".into()]).is_err());
-        assert!(parse_set_args(&["--unknown".into()]).is_err());
+        assert!(parse_set_args(&["--warmth".into(), "200".into()], "set").is_err());
+        assert!(parse_set_args(&["--brightness".into(), "5".into()], "set").is_err());
+        assert!(parse_set_args(&["--mode".into(), "schedule".into()], "set").is_err());
+        assert!(parse_set_args(&["--night-start".into(), "9:00".into()], "set").is_err());
+        assert!(parse_set_args(&["--transition".into(), "999".into()], "set").is_err());
+        assert!(parse_set_args(&["--unknown".into()], "set").is_err());
         assert!(matches!(
-            parse_set_args(&["--help".into()]).unwrap(),
+            parse_set_args(&["--help".into()], "set").unwrap(),
             SetParse::Help(_)
         ));
     }
@@ -731,5 +886,143 @@ mod tests {
             }
             .is_empty()
         );
+    }
+
+    #[test]
+    fn format_apply_command_manual_preset() {
+        let preset = Preset {
+            automatic: false,
+            manual: Levels {
+                warmth: 50,
+                brightness: 90,
+            },
+            schedule: Schedule::default(),
+        };
+        assert_eq!(
+            format_apply_command(&preset),
+            "waywarm apply --mode manual --warmth 50 --brightness 90"
+        );
+    }
+
+    #[test]
+    fn format_apply_command_automatic_fixed() {
+        let preset = Preset {
+            automatic: true,
+            manual: Levels::default(),
+            schedule: Schedule {
+                night_start: "21:00".into(),
+                day_start: "07:00".into(),
+                transition_minutes: 30,
+                day: Levels {
+                    warmth: 0,
+                    brightness: 100,
+                },
+                night: Levels {
+                    warmth: 50,
+                    brightness: 90,
+                },
+                timing: ScheduleTiming::Fixed,
+                latitude: 0.0,
+                longitude: 0.0,
+            },
+        };
+        assert_eq!(
+            format_apply_command(&preset),
+            "waywarm apply --mode automatic --day-warmth 0 --day-brightness 100 --night-warmth 50 --night-brightness 90 --night-start 21:00 --day-start 07:00 --transition 30 --timing fixed"
+        );
+    }
+
+    #[test]
+    fn format_apply_command_automatic_location() {
+        let preset = Preset {
+            automatic: true,
+            manual: Levels::default(),
+            schedule: Schedule {
+                night_start: "21:00".into(),
+                day_start: "07:00".into(),
+                transition_minutes: 45,
+                day: Levels {
+                    warmth: 10,
+                    brightness: 100,
+                },
+                night: Levels {
+                    warmth: 55,
+                    brightness: 85,
+                },
+                timing: ScheduleTiming::Location,
+                latitude: 48.8566,
+                longitude: 2.3522,
+            },
+        };
+        assert_eq!(
+            format_apply_command(&preset),
+            "waywarm apply --mode automatic --day-warmth 10 --day-brightness 100 --night-warmth 55 --night-brightness 85 --night-start 21:00 --day-start 07:00 --transition 45 --timing location --latitude 48.8566 --longitude 2.3522"
+        );
+    }
+
+    #[test]
+    fn format_apply_command_round_trips_through_apply_options() {
+        let preset = Preset {
+            automatic: true,
+            manual: Levels {
+                warmth: 12,
+                brightness: 88,
+            },
+            schedule: Schedule {
+                night_start: "22:15".into(),
+                day_start: "06:45".into(),
+                transition_minutes: 20,
+                day: Levels {
+                    warmth: 5,
+                    brightness: 95,
+                },
+                night: Levels {
+                    warmth: 70,
+                    brightness: 80,
+                },
+                timing: ScheduleTiming::Location,
+                latitude: -33.8688,
+                longitude: 151.2093,
+            },
+        };
+        let command = format_apply_command(&preset);
+        let tokens: Vec<String> = command
+            .split_whitespace()
+            .skip(2) // waywarm apply
+            .map(str::to_owned)
+            .collect();
+        let SetParse::Options { options, .. } = parse_set_args(&tokens, "apply").unwrap() else {
+            panic!("expected options");
+        };
+        let mut settings = Settings::default();
+        apply_set_options(&mut settings, &options).unwrap();
+        settings.enabled = true;
+        assert!(settings.automatic);
+        assert_eq!(settings.schedule, preset.schedule);
+    }
+
+    #[test]
+    fn format_apply_command_manual_round_trips() {
+        let preset = Preset {
+            automatic: false,
+            manual: Levels {
+                warmth: 42,
+                brightness: 75,
+            },
+            schedule: Schedule::default(),
+        };
+        let command = format_apply_command(&preset);
+        let tokens: Vec<String> = command
+            .split_whitespace()
+            .skip(2)
+            .map(str::to_owned)
+            .collect();
+        let SetParse::Options { options, .. } = parse_set_args(&tokens, "apply").unwrap() else {
+            panic!("expected options");
+        };
+        let mut settings = Settings::default();
+        apply_set_options(&mut settings, &options).unwrap();
+        assert!(!settings.automatic);
+        assert_eq!(settings.manual, preset.manual);
     }
 }
